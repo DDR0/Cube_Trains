@@ -1,0 +1,76 @@
+#!/bin/sh
+
+echo Pulling CT.
+git pull
+
+echo Fetching upstream Frogatto and merging.
+git fetch upstream
+
+git checkout FETCH_HEAD FreeMono.ttf
+git checkout FETCH_HEAD .gitignore
+git checkout FETCH_HEAD ct
+
+git checkout FETCH_HEAD data/achievements.cfg        
+git checkout FETCH_HEAD data/leaderboards.cfg
+git checkout FETCH_HEAD data/control_schemes.cfg     
+git checkout FETCH_HEAD data/dialog_font.cfg         
+git checkout FETCH_HEAD data/level-template.cfg
+git checkout FETCH_HEAD data/dialog_font.ja.cfg      
+git checkout FETCH_HEAD data/list-functions.cfg
+git checkout FETCH_HEAD data/dialog_font.zh_CN.cfg   
+git checkout FETCH_HEAD data/number_font.cfg               
+git checkout FETCH_HEAD data/number_font_large.cfg
+git checkout FETCH_HEAD data/editor.cfg            
+git checkout FETCH_HEAD data/fonts.cfg        
+git checkout FETCH_HEAD data/fonts.ja.cfg            
+git checkout FETCH_HEAD data/outline_font.cfg
+git checkout FETCH_HEAD data/fonts.zh_CN.cfg         
+git checkout FETCH_HEAD data/outline_font.ja.cfg
+git checkout FETCH_HEAD data/functions.cfg           
+git checkout FETCH_HEAD data/outline_font.zh_CN.cfg
+git checkout FETCH_HEAD data/geometry-functions.cfg  
+git checkout FETCH_HEAD data/powerups.cfg         
+git checkout FETCH_HEAD data/preload.cfg
+git checkout FETCH_HEAD data/gui.cfg                 
+git checkout FETCH_HEAD data/schema.cfg
+git checkout FETCH_HEAD data/label_font.cfg     
+git checkout FETCH_HEAD data/label_font.ja.cfg  
+git checkout FETCH_HEAD data/label_font.zh_CN.cfg    
+git checkout FETCH_HEAD data/time-functions.cfg
+
+git checkout FETCH_HEAD data/editor
+
+git checkout FETCH_HEAD data/gui
+
+git checkout FETCH_HEAD data/level/cube-trains
+
+git checkout FETCH_HEAD data/object_prototypes
+
+git checkout FETCH_HEAD data/objects/effects
+
+git checkout FETCH_HEAD data/objects/experimental
+
+git checkout FETCH_HEAD data/objects/hud-elements
+
+git checkout FETCH_HEAD data/shaders
+
+git checkout FETCH_HEAD images/window-icon.png
+
+git checkout FETCH_HEAD images/backgrounds/loading_screen.png
+
+git checkout FETCH_HEAD images/effects/particles.png
+
+git checkout FETCH_HEAD images/experimental/cube\ trains  
+git checkout FETCH_HEAD images/experimental/spiderbot.png
+
+git checkout FETCH_HEAD images/gui
+
+git checkout FETCH_HEAD locale
+	
+git checkout FETCH_HEAD MacOS
+	
+git checkout FETCH_HEAD po
+
+git checkout FETCH_HEAD .tx
+
+echo Done.
