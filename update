@@ -29,8 +29,7 @@ git checkout upstream/master data/outline_font.ja.cfg
 git checkout upstream/master data/functions.cfg           
 git checkout upstream/master data/outline_font.zh_CN.cfg
 git checkout upstream/master data/geometry-functions.cfg  
-git checkout upstream/master data/powerups.cfg         
-git checkout upstream/master data/preload.cfg
+git checkout upstream/master data/powerups.cfg   
 git checkout upstream/master data/gui.cfg                 
 git checkout upstream/master data/schema.cfg
 git checkout upstream/master data/label_font.cfg     
