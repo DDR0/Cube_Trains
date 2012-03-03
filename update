@@ -10,6 +10,24 @@ git checkout upstream/master FreeMono.ttf
 git checkout upstream/master .gitignore
 git checkout upstream/master ct
 
+git checkout upstream/master bar-descriptor.xml      
+git checkout upstream/master Makefile.ac100
+git checkout upstream/master Makefile.common
+git checkout upstream/master Makefile.harmattan
+git checkout upstream/master Makefile.mac       
+git checkout upstream/master Makefile.pandora
+git checkout upstream/master Makefile-win
+git checkout upstream/master make-tileset.pl
+git checkout upstream/master DejaVuSans.ttf
+git checkout upstream/master FONT_GENERATION
+git checkout upstream/master Rakefile
+git checkout upstream/master INSTALL
+git checkout upstream/master .project
+git checkout upstream/master .cproject
+git checkout upstream/master src
+git checkout upstream/master surface_scaling.cfg
+git checkout upstream/master Makefile
+
 git checkout upstream/master data/achievements.cfg        
 git checkout upstream/master data/leaderboards.cfg
 git checkout upstream/master data/control_schemes.cfg     
@@ -72,4 +90,12 @@ git checkout upstream/master po
 
 git checkout upstream/master .tx
 
+echo Making test build.
+make clean
+make
+./ct
+
+echo Pushing.
+git gui
+git push
 echo Done.
