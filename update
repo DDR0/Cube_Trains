@@ -72,6 +72,7 @@ git checkout upstream/master data/objects/hud-elements
 git checkout upstream/master data/shaders
 
 git checkout upstream/master images/window-icon.png
+git checkout upstream/master images/cube-trains-icon.png
 
 git checkout upstream/master images/backgrounds/loading_screen.png
 
