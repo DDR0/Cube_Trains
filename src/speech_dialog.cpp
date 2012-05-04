@@ -17,6 +17,7 @@
 #include "raster.hpp"
 #include "speech_dialog.hpp"
 #include "iphone_controls.hpp"
+#include "asserts.hpp"
 
 namespace {
 #if TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE
@@ -35,12 +36,18 @@ namespace {
 
 speech_dialog::speech_dialog()
   : cycle_(0), left_side_speaking_(false), horizontal_position_(0), text_char_(0), option_selected_(0),
+#if defined(__ANDROID__)
+    joystick_button_pressed_(false),
+    joystick_up_pressed_(false),
+    joystick_down_pressed_(false),
+#else // !defined(__ANDROID__)
     joystick_button_pressed_(true),
     joystick_up_pressed_(true),
     joystick_down_pressed_(true),
+#endif // defined(__ANDROID__)
 	expiration_(-1)
 {
-#if TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE
+#if TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE || defined(__ANDROID__)
 	option_selected_ = -1;
 #endif
 }
@@ -101,7 +108,9 @@ bool speech_dialog::key_press(const SDL_Event& event)
 			}
 		}
 	
-#if TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE || TARGET_BLACKBERRY
+#if defined(__ANDROID__)
+		// XXX: todo
+#elif TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE || TARGET_BLACKBERRY
 		if(event.type == SDL_MOUSEBUTTONDOWN)
 		{
 			last_mouse = event.button.which;
@@ -127,6 +136,11 @@ bool speech_dialog::key_press(const SDL_Event& event)
 		return false; // only keydown and mousebuttondown should be handled by the rest of the function
 	}
 
+	return scroll_text();
+}
+
+bool speech_dialog::scroll_text()
+{
 	if(text_char_ < num_chars()) {
 		text_char_ = num_chars();
 		return false;
@@ -173,6 +187,7 @@ bool speech_dialog::process()
 		}
 	}
 
+#if !defined(__ANDROID__)
 	if(expiration_ <= 0) {
 		joystick::update();
 
@@ -183,17 +198,30 @@ bool speech_dialog::process()
 		if(!joystick_down_pressed_ && joystick::down()) {
 			move_down();
 		}
-
-		if(!joystick_button_pressed_ && (joystick::button(0) || joystick::button(10))) {
-			return true;
-		}
 	}
 
 	joystick_up_pressed_ = joystick::up();
 	joystick_down_pressed_ = joystick::down();
-	joystick_button_pressed_ = joystick::button(0) || joystick::button(1);
+#endif 
 
 	return cycle_ == expiration_;
+}
+
+bool speech_dialog::detect_joystick_press()
+{
+#if defined(__ANDROID__)
+    return false;
+#else //!defined(__ANDROID__)
+	const bool new_press = joystick::button(0) || joystick::button(1);
+	const bool is_pressed = new_press && !joystick_button_pressed_;
+	joystick_button_pressed_ = new_press;
+
+	if(is_pressed) {
+		return scroll_text();
+	} else {
+		return false;
+	}
+#endif
 }
 
 void speech_dialog::draw() const
@@ -374,7 +402,7 @@ void speech_dialog::set_text(const std::vector<std::string>& text)
 void speech_dialog::set_options(const std::vector<std::string>& options)
 {
 	options_ = options;
-#if TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE
+#if TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE  || defined(__ANDROID__)
 	option_selected_ = -1;
 #else
 	option_selected_ = 0;

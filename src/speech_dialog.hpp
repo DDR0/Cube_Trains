@@ -1,7 +1,7 @@
 #ifndef SPEECH_DIALOG_HPP_INCLUDED
 #define SPEECH_DIALOG_HPP_INCLUDED
 
-#include "SDL.h"
+#include "graphics.hpp"
 
 #include <string>
 #include <vector>
@@ -16,6 +16,7 @@ public:
 	speech_dialog();
 	~speech_dialog();
 
+	bool detect_joystick_press();
 	bool key_press(const SDL_Event& e);
 	bool process();
 	void draw() const;
@@ -32,6 +33,8 @@ private:
 	bool handle_mouse_move(int x, int y);
 	void move_up();
 	void move_down();
+
+	bool scroll_text();
 
 	int cycle_;
 	const_entity_ptr left_, right_;

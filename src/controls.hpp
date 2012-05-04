@@ -1,15 +1,12 @@
 #ifndef CONTROLS_HPP_INCLUDED
 #define CONTROLS_HPP_INCLUDED
 
+#include <boost/scoped_ptr.hpp>
+
 #include <vector>
 #include <cstddef>
 
-//#include <SDL.h>
-//#if SDL_VERSION_ATLEAST(1,3,0)
-//#include <SDL_keycode.h>
-//#else
-#include <SDL_keysym.h>
-//#endif
+#include "graphics.hpp"
 
 namespace controls {
 
@@ -37,7 +34,19 @@ public:
 	~local_controls_lock();
 };
 
+class control_backup_scope_impl;
+class control_backup_scope {
+public:
+	control_backup_scope();
+	~control_backup_scope();
+private:
+	boost::scoped_ptr<control_backup_scope_impl> impl_;
+};
+
+void read_until(int ncycle);
+int local_controls_end();
 void read_local_controls();
+void unread_local_controls();
 void ignore_current_keypresses();
 
 void get_control_status(int cycle, int player, bool* output);

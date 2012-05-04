@@ -5,15 +5,14 @@
 #endif
 
 #include <assert.h>
-#include <inttypes.h>
+#include <boost/cstdint.hpp>
 
 #include <stdio.h>
 
 #include <stack>
 #include <vector>
 
-#include "SDL.h"
-
+#include "graphics.hpp"
 #include "asserts.hpp"
 #include "controls.hpp"
 #include "foreach.hpp"
@@ -64,6 +63,14 @@ SDLKey sdlk[NUM_CONTROLS] = {
 #endif
 };
 
+//If any of these keys are held, we ignore other keyboard input.
+SDLKey control_keys[] = {
+	SDLK_LCTRL,
+	SDLK_RCTRL,
+	SDLK_LALT,
+	SDLK_RALT,
+};
+
 int32_t our_highest_confirmed() {
 	int32_t res = -1;
 	for(int n = 0; n != nplayers; ++n) {
@@ -79,6 +86,30 @@ CKey& keyboard() {
 	static CKey key;
 	return key;
 }
+}
+
+struct control_backup_scope_impl {
+	std::vector<unsigned char> controls[MAX_PLAYERS];
+	int32_t highest_confirmed[MAX_PLAYERS];
+	int starting_cycles;
+};
+
+control_backup_scope::control_backup_scope() : impl_(new control_backup_scope_impl)
+{
+	impl_->starting_cycles = starting_cycles;
+	for(int n = 0; n != MAX_PLAYERS; ++n) {
+		impl_->controls[n] = controls[n];
+		impl_->highest_confirmed[n] = highest_confirmed[n];
+	}
+}
+
+control_backup_scope::~control_backup_scope()
+{
+	starting_cycles = impl_->starting_cycles;
+	for(int n = 0; n != MAX_PLAYERS; ++n) {
+		controls[n] = impl_->controls[n];
+		highest_confirmed[n] = impl_->highest_confirmed[n];
+	}
 }
 
 int their_highest_confirmed() {
@@ -146,6 +177,30 @@ void ignore_current_keypresses()
 	}
 }
 
+void read_until(int ncycle)
+{
+	if(local_player < 0 || local_player >= nplayers) {
+		return;
+	}
+
+	while(controls[local_player].size() <= ncycle) {
+		read_local_controls();
+	}
+
+	while(controls[local_player].size() > ncycle+1) {
+		unread_local_controls();
+	}
+}
+
+int local_controls_end()
+{
+	if(local_player < 0 || local_player >= nplayers) {
+		return 0;
+	}
+
+	return controls[local_player].size();
+}
+
 void read_local_controls()
 {
 	if(local_player < 0 || local_player >= nplayers) {
@@ -156,8 +211,17 @@ void read_local_controls()
 
 	unsigned char state = 0;
 	if(local_control_locks.empty()) {
+#if !defined(__ANDROID__)
+		bool ignore_keypresses = false;
+		foreach(const SDLKey& k, control_keys) {
+			if(keyboard()[k]) {
+				ignore_keypresses = true;
+				break;
+			}
+		}
+
 		for(int n = 0; n < NUM_CONTROLS; ++n) {
-			if(keyboard()[sdlk[n]]) {
+			if(keyboard()[sdlk[n]] && !ignore_keypresses) {
 				if(!key_ignore[n]) {
 					state |= (1 << n);
 				}
@@ -165,14 +229,25 @@ void read_local_controls()
 				key_ignore[n] = false;
 			}
 		}
+#endif
 
-		if(joystick::up() || iphone_controls::up()) { state |= (1 << CONTROL_UP); }
-		if(joystick::down() || iphone_controls::down()) { state |= (1 << CONTROL_DOWN); }
-		if(joystick::left() || iphone_controls::left()) { state |= (1 << CONTROL_LEFT); }
-		if(joystick::right() || iphone_controls::right()) { state |= (1 << CONTROL_RIGHT); }
-		if(joystick::button(0) || iphone_controls::attack()) { state |= (1 << CONTROL_ATTACK); }
-		if(joystick::button(1) || iphone_controls::jump()) { state |= (1 << CONTROL_JUMP); }
-		if(joystick::button(2) || iphone_controls::tongue()) { state |= (1 << CONTROL_TONGUE); }
+#if defined(__ANDROID__)
+		if(iphone_controls::up()) { state |= (1 << CONTROL_UP); }
+		if(iphone_controls::down()) { state |= (1 << CONTROL_DOWN); }
+		if(iphone_controls::left()) { state |= (1 << CONTROL_LEFT); }
+		if(iphone_controls::right()) { state |= (1 << CONTROL_RIGHT); }
+		if(iphone_controls::attack()) { state |= (1 << CONTROL_ATTACK); }
+		if(iphone_controls::jump()) { state |= (1 << CONTROL_JUMP); }
+		if(iphone_controls::tongue()) { state |= (1 << CONTROL_TONGUE); }
+#else
+		if(joystick::up() || iphone_controls::up()) { state |= (1 << CONTROL_UP);}
+		if(joystick::down() || iphone_controls::down()) { state |= (1 << CONTROL_DOWN);}
+		if(joystick::left() || iphone_controls::left()) { state |= (1 << CONTROL_LEFT);}
+		if(joystick::right() || iphone_controls::right()) { state |= (1 << CONTROL_RIGHT);}
+		if(joystick::button(0) || iphone_controls::attack()) { state |= (1 << CONTROL_ATTACK);}
+		if(joystick::button(1) || iphone_controls::jump()) { state |= (1 << CONTROL_JUMP);}
+		if(joystick::button(2) || iphone_controls::tongue()) { state |= (1 << CONTROL_TONGUE);}
+#endif
 	} else {
 		//we have the controls locked into a specific state.
 		state = local_control_locks.top();
@@ -193,6 +268,16 @@ void read_local_controls()
 			}
 		}
 	}
+}
+
+void unread_local_controls()
+{
+	if(local_player < 0 || local_player >= nplayers || controls[local_player].empty()) {
+		return;
+	}
+
+	controls[local_player].pop_back();
+	highest_confirmed[local_player]--;
 }
 
 void get_control_status(int cycle, int player, bool* output)

@@ -10,16 +10,19 @@
 #include "controls.hpp"
 #include "draw_scene.hpp"
 #include "draw_tile.hpp"
+#include "editor.hpp"
 #include "entity.hpp"
 #include "filesystem.hpp"
 #include "foreach.hpp"
 #include "formatter.hpp"
 #include "gui_formula_functions.hpp"
 #include "iphone_controls.hpp"
+#include "json_parser.hpp"
 #include "level.hpp"
 #include "level_object.hpp"
 #include "light.hpp"
 #include "load_level.hpp"
+#include "module.hpp"
 #include "multiplayer.hpp"
 #include "object_events.hpp"
 #include "player_info.hpp"
@@ -36,24 +39,23 @@
 #include "thread.hpp"
 #include "tile_map.hpp"
 #include "unit_test.hpp"
+#include "variant_utils.hpp"
 #include "wml_formula_callable.hpp"
-#include "wml_node.hpp"
-#include "wml_parser.hpp"
-#include "wml_utils.hpp"
-#include "wml_writer.hpp"
 #include "color_utils.hpp"
+
+#include "compat.hpp"
 
 namespace {
 boost::intrusive_ptr<level> current_level;
 
 std::map<std::string, level::summary> load_level_summaries() {
 	std::map<std::string, level::summary> result;
-	const wml::const_node_ptr node = wml::parse_wml_from_file("data/compiled/level_index.cfg");
+	const variant node = json::parse_from_file("data/compiled/level_index.cfg");
 	
-	FOREACH_WML_CHILD(level_node, node, "level") {
-		level::summary& s = result[level_node->attr("level")];
-		s.music = level_node->attr("music");
-		s.title = level_node->attr("title");
+	foreach(variant level_node, node["level"].as_list()) {
+		level::summary& s = result[level_node["level"].as_string()];
+		s.music = level_node["music"].as_string();
+		s.title = level_node["title"].as_string();
 	}
 
 	return result;
@@ -63,6 +65,11 @@ bool level_tile_not_in_rect(const rect& r, const level_tile& t) {
 	return t.x < r.x() || t.y < r.y() || t.x >= r.x2() || t.y >= r.y2();
 }
 
+}
+
+void level::clear_current_level()
+{
+	current_level.reset();
 }
 
 level::summary level::get_summary(const std::string& id)
@@ -82,18 +89,35 @@ level& level::current()
 	return *current_level;
 }
 
+level* level::current_ptr()
+{
+	return current_level.get();
+}
+
+current_level_scope::current_level_scope(level* lvl) : old_(current_level)
+{
+	lvl->set_as_current_level();
+}
+
+current_level_scope::~current_level_scope() {
+	if(old_) {
+		old_->set_as_current_level();
+	}
+}
+
 void level::set_as_current_level()
 {
 	current_level = this;
 	frame::set_color_palette(palettes_used_);
 
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !TARGET_BLACKBERRY
+#ifndef NO_EDITOR
 	static const int starting_x_resolution = preferences::actual_screen_width();
 	static const int starting_y_resolution = preferences::actual_screen_height();
 	static const int starting_virtual_x_resolution = preferences::virtual_screen_width();
 	static const int starting_virtual_y_resolution = preferences::virtual_screen_height();
 
-	if(!editor_ && starting_x_resolution == starting_virtual_x_resolution) {
+	if(!editor_ && !editor_resolution_manager::is_active() && starting_x_resolution == starting_virtual_x_resolution) {
 		if(!x_resolution_) {
 			x_resolution_ = starting_x_resolution;
 		}
@@ -104,6 +128,8 @@ void level::set_as_current_level()
 
 
 		if(x_resolution_ != preferences::actual_screen_width() || y_resolution_ != preferences::actual_screen_height()) {
+
+			std::cerr << "RESETTING VIDEO MODE: " << x_resolution_ << ", " << y_resolution_ << "\n";
 			const bool result = graphics::set_video_mode(x_resolution_, y_resolution_);
 			if(result) {
 				preferences::set_actual_screen_width(x_resolution_);
@@ -114,6 +140,7 @@ void level::set_as_current_level()
 		}
 	}
 	
+#endif // !NO_EDITOR
 #endif
 }
 
@@ -123,14 +150,14 @@ graphics::color_transform default_dark_color() {
 }
 }
 
-level::level(const std::string& level_cfg)
+level::level(const std::string& level_cfg, variant node)
 	: id_(level_cfg),
 	  x_resolution_(0), y_resolution_(0),
 	  highlight_layer_(INT_MIN),
 	  num_compiled_tiles_(0),
 	  entered_portal_active_(false), save_point_x_(-1), save_point_y_(-1),
 	  editor_(false), show_foreground_(true), show_background_(true), dark_(false), dark_color_(graphics::color_transform(0, 0, 0, 255)), air_resistance_(0), water_resistance_(7), end_game_(false),
-      editor_tile_updates_frozen_(0), zoom_level_(1),
+      editor_tile_updates_frozen_(0), zoom_level_(decimal::from_int(1)),
 	  palettes_used_(0),
 	  background_palette_(-1),
 	  segment_width_(0), segment_height_(0)
@@ -138,158 +165,120 @@ level::level(const std::string& level_cfg)
 	std::cerr << "in level constructor...\n";
 	const int start_time = SDL_GetTicks();
 
-	wml::const_node_ptr node = load_level_wml(level_cfg);
-	wml::const_node_ptr player_save_node;
-	ASSERT_LOG(node.get() != NULL, "LOAD LEVEL WML FOR " << level_cfg << " FAILED");
-	if(node->has_attr("id")) {
-		id_ = node->attr("id");
+	if(node.is_null()) {
+		node = load_level_wml(level_cfg);
+	}
+
+	variant player_save_node;
+	ASSERT_LOG(node.is_null() == false, "LOAD LEVEL WML FOR " << level_cfg << " FAILED");
+	if(node.has_key("id")) {
+		id_ = node["id"].as_string();
 	}
 
 	if(preferences::load_compiled() && (level_cfg == "save.cfg" || level_cfg == "autosave.cfg")) {
-		if(preferences::version() != node->attr("version").str()) {
+		if(preferences::version() != node["version"].as_string()) {
 			std::cerr << "DIFFERENT VERSION LEVEL\n";
-			FOREACH_WML_CHILD(obj_node, node, "character") {
-				if(wml::get_bool(obj_node, "is_human", false)) {
+			foreach(variant obj_node, node["character"].as_list()) {
+				if(obj_node["is_human"].as_bool(false)) {
 					player_save_node = obj_node;
 					break;
 				}
 			}
 
-			wml::const_node_ptr n = node;
-			if(node->has_attr("id")) {
-				n = load_level_wml(node->attr("id"));
-			} else {
-				//this save was made before we saved level ID's. The best
-				//we can do is get a level with a matching title.
-				std::vector<std::string> files;
-				sys::get_files_in_dir("data/compiled/level/", &files);
-				foreach(const std::string& file, files) {
-					if(file == "save.cfg" || file == "autosave.cfg") {
-						continue;
-					}
-
-					wml::const_node_ptr lvl_info = load_level_wml(file);
-					if(lvl_info->attr("title").str() == node->attr("title").str()) {
-						if(lvl_info->attr("dimensions").str() == node->attr("dimensions").str()) {
-							//the dimensions match so we're sure this is
-							//the right one.
-							n = lvl_info;
-							break;
-						}
-
-						//tenatively guess this is the level, but keep
-						//searching in case one with an exact dimensional
-						//match is found.
-						n = lvl_info;
-					}
-				}
+			variant n = node;
+			if(node.has_key("id")) {
+				n = load_level_wml(node["id"].as_string());
 			}
-			//in case the player had swallowed an object, copy it
-			//over from the savegame.
-			wml::node::const_child_iterator i1 = node->begin_child("serialized_objects");
-			wml::node::const_child_iterator i2 = n->begin_child("serialized_objects");
-			if(i1 != node->end_child("serialized_objects") && i2 != n->end_child("serialized_objects")) {
-				wml::node::const_child_iterator j1 = (i1->second)->begin_child("character");
-				wml::node::const_child_iterator j2 = (i1->second)->end_child("character");
-				while(j1 != j2) {
-					(i2->second)->add_child(j1->second);
-					++j1;
-				}
-			}
+
+			n = n.add_attr(variant("serialized_objects"), n["serialized_objects"] + node["serialized_objects"]);
+
 			node = n;
 		}
 	}
 
 	dark_color_ = default_dark_color();
-	if(wml::get_bool(node, "dark", false)) {
+	if(node["dark"].as_bool(false)) {
 		dark_ = true;
 	}
 
-	if(node->has_attr("dark_color")) {
-		dark_color_ = graphics::color_transform(node->attr("dark_color"));
+	if(node.has_key("dark_color")) {
+		dark_color_ = graphics::color_transform(node["dark_color"]);
 	}
 
-	if(node->get_child("vars")) {
-		wml::const_node_ptr vars = node->get_child("vars");
-		for(wml::node::const_attr_iterator i = vars->begin_attr();
-		    i != vars->end_attr(); ++i) {
-			vars_[i->first].serialize_from_string(i->second);
-		}
+	vars_ = node["vars"];
+	if(vars_.is_map() == false) {
+		std::map<variant,variant> m;
+		vars_ = variant(&m);
 	}
 
-	segment_width_ = wml::get_int(node, "segment_width");
+	segment_width_ = node["segment_width"].as_int();
 	ASSERT_LOG(segment_width_%32 == 0, "segment_width in " << id_ << " is not divisible by 32");
 
-	segment_height_ = wml::get_int(node, "segment_height");
+	segment_height_ = node["segment_height"].as_int();
 	ASSERT_LOG(segment_height_%32 == 0, "segment_height in " << id_ << " is not divisible by 32");
 
-	music_ = node->attr("music");
-	replay_data_ = node->attr("replay_data");
-	cycle_ = wml::get_int(node, "cycle");
+	music_ = node["music"].as_string_default();
+	replay_data_ = node["replay_data"].as_string_default();
+	cycle_ = node["cycle"].as_int();
 	time_freeze_ = 0;
-	x_resolution_ = wml::get_int(node, "x_resolution");
-	y_resolution_ = wml::get_int(node, "y_resolution");
+	x_resolution_ = node["x_resolution"].as_int();
+	y_resolution_ = node["y_resolution"].as_int();
 	in_dialog_ = false;
-	title_ = node->attr("title");
-	if(node->has_attr("dimensions")) {
-		boundaries_ = rect(node->attr("dimensions"));
+	title_ = node["title"].as_string_default();
+	if(node.has_key("dimensions")) {
+		boundaries_ = rect(node["dimensions"]);
 	} else {
-		boundaries_ = rect(0, 0, wml::get_int(node, "width", 800), wml::get_int(node, "height", 600));
+		boundaries_ = rect(0, 0, node["width"].as_int(800), node["height"].as_int(600));
 	}
 
-	if(node->has_attr("lock_screen")) {
-		lock_screen_.reset(new point(node->attr("lock_screen")));
+	if(node.has_key("lock_screen")) {
+		lock_screen_.reset(new point(node["lock_screen"].as_string()));
 	}
 
-	if(node->has_attr("opaque_rects")) {
-		const std::vector<std::string> opaque_rects_str = util::split(node->attr("opaque_rects"), ':');
+	if(node.has_key("opaque_rects")) {
+		const std::vector<std::string> opaque_rects_str = util::split(node["opaque_rects"].as_string(), ':');
 		foreach(const std::string& r, opaque_rects_str) {
 			opaque_rects_.push_back(rect(r));
 			std::cerr << "OPAQUE RECT: " << r << "\n";
 		}
 	}
 
-	xscale_ = wml::get_int(node, "xscale", 100);
-	yscale_ = wml::get_int(node, "yscale", 100);
-	auto_move_camera_ = point(node->attr("auto_move_camera"));
-	air_resistance_ = wml::get_int(node, "air_resistance", 20);
-	water_resistance_ = wml::get_int(node, "water_resistance", 100);
+	xscale_ = node["xscale"].as_int(100);
+	yscale_ = node["yscale"].as_int(100);
+	auto_move_camera_ = point(node["auto_move_camera"]);
+	air_resistance_ = node["air_resistance"].as_int(20);
+	water_resistance_ = node["water_resistance"].as_int(100);
 
-	camera_rotation_ = game_logic::formula::create_optional_formula(node->attr("camera_rotation"));
+	camera_rotation_ = game_logic::formula::create_optional_formula(node["camera_rotation"]);
 
-	preloads_ = util::split(node->attr("preloads"));
+	preloads_ = util::split(node["preloads"].as_string());
 
-	wml::node::const_child_iterator r1 = node->begin_child("solid_rect");
-	wml::node::const_child_iterator r2 = node->end_child("solid_rect");
-	for(; r1 != r2; ++r1) {
+	std::string empty_solid_info;
+	foreach(variant rect_node, node["solid_rect"].as_list()) {
 		solid_rect r;
-		r.r = rect(r1->second->attr("rect"));
-		r.friction = wml::get_int(r1->second, "friction", 100);
-		r.traction = wml::get_int(r1->second, "traction", 100);
-		r.damage = wml::get_int(r1->second, "damage");
+		r.r = rect(rect_node["rect"]);
+		r.friction = rect_node["friction"].as_int(100);
+		r.traction = rect_node["traction"].as_int(100);
+		r.damage = rect_node["damage"].as_int();
 		solid_rects_.push_back(r);
-		add_solid_rect(r.r.x(), r.r.y(), r.r.x2(), r.r.y2(), r.friction, r.traction, r.damage);
+		add_solid_rect(r.r.x(), r.r.y(), r.r.x2(), r.r.y2(), r.friction, r.traction, r.damage, empty_solid_info);
 	}
 
 	std::cerr << "building..." << SDL_GetTicks() << "\n";
-	wml::node::const_child_iterator t1 = node->begin_child("tile");
-	wml::node::const_child_iterator t2 = node->end_child("tile");
 	widest_tile_ = 0;
 	highest_tile_ = 0;
 	layers_.insert(0);
-	for(; t1 != t2; ++t1) {
-		const level_tile t = level_object::build_tile(t1->second);
+	foreach(variant tile_node, node["tile"].as_list()) {
+		const level_tile t = level_object::build_tile(tile_node);
 		tiles_.push_back(t);
 		layers_.insert(t.zorder);
 		add_tile_solid(t);
 	}
 	std::cerr << "done building..." << SDL_GetTicks() << "\n";
 
-	t1 = node->begin_child("tile_map");
-	t2 = node->end_child("tile_map");
 	int begin_tile_index = tiles_.size();
-	for(; t1 != t2; ++t1) {
-		tile_map m(t1->second);
+	foreach(variant tile_node, node["tile_map"].as_list()) {
+		tile_map m(tile_node);
 		tile_maps_[m.zorder()] = m;
 		const int before = tiles_.size();
 		tile_maps_[m.zorder()].build_tiles(&tiles_);
@@ -298,16 +287,14 @@ level::level(const std::string& level_cfg)
 
 	std::cerr << "done building tile_map..." << SDL_GetTicks() << "\n";
 
-	num_compiled_tiles_ = wml::get_int(node, "num_compiled_tiles");
+	num_compiled_tiles_ = node["num_compiled_tiles"].as_int();
 
 	tiles_.resize(tiles_.size() + num_compiled_tiles_);
 	std::vector<level_tile>::iterator compiled_itor = tiles_.end() - num_compiled_tiles_;
 
-	t1 = node->begin_child("compiled_tiles");
-	t2 = node->end_child("compiled_tiles");
-	for(; t1 != t2; ++t1) {
-		read_compiled_tiles(t1->second, compiled_itor);
-		wml_compiled_tiles_.push_back(t1->second);
+	foreach(variant tile_node, node["compiled_tiles"].as_list()) {
+		read_compiled_tiles(tile_node, compiled_itor);
+		wml_compiled_tiles_.push_back(tile_node);
 	}
 
 	ASSERT_LOG(compiled_itor == tiles_.end(), "INCORRECT NUMBER OF COMPILED TILES");
@@ -321,96 +308,100 @@ level::level(const std::string& level_cfg)
 		std::sort(tiles_.begin(), tiles_.end(), level_tile_zorder_pos_comparer());
 	}
 
-	if(node->has_attr("palettes")) {
-		std::vector<std::string> v = util::split(node->attr("palettes"));
+	if(node.has_key("palettes")) {
+		std::vector<std::string> v = util::split(node["palettes"].as_string());
 		foreach(const std::string& p, v) {
 			const int id = graphics::get_palette_id(p);
 			palettes_used_ |= (1 << id);
 		}
 	}
 
-	if(node->has_attr("background_palette")) {
-		background_palette_ = graphics::get_palette_id(node->attr("background_palette"));
+	if(node.has_key("background_palette")) {
+		background_palette_ = graphics::get_palette_id(node["background_palette"].as_string());
 	}
 
 	prepare_tiles_for_drawing();
 
-	wml::node::const_child_iterator c1 = node->begin_child("character");
-	wml::node::const_child_iterator c2 = node->end_child("character");
-	for(; c1 != c2; ++c1) {
-		if(player_save_node.get() != NULL && wml::get_bool(c1->second, "is_human", false)) {
+	foreach(variant char_node, node["character"].as_list()) {
+		if(player_save_node.is_null() == false && char_node["is_human"].as_bool(false)) {
 			continue;
 		}
 
-		wml_chars_.push_back(c1->second);
+		wml_chars_.push_back(char_node);
 		continue;
 	}
 
-	if(player_save_node.get() != NULL) {
+	if(player_save_node.is_null() == false) {
 		wml_chars_.push_back(player_save_node);
 	}
 
-	wml::const_node_ptr serialized_objects = node->get_child("serialized_objects");
-	if(serialized_objects.get() != NULL) {
-		wml_chars_.push_back(serialized_objects);
+	variant serialized_objects = node["serialized_objects"];
+	if(serialized_objects.is_null() == false) {
+		serialized_objects_.push_back(serialized_objects);
 	}
 
-	wml::node::const_child_iterator p1 = node->begin_child("portal");
-	wml::node::const_child_iterator p2 = node->end_child("portal");
-	for(; p1 != p2; ++p1) {
+	foreach(variant portal_node, node["portal"].as_list()) {
 		portal p;
-		p.area = rect(p1->second->attr("rect"));
-		p.level_dest = p1->second->attr("level");
-		p.dest = point(p1->second->attr("dest"));
-		p.dest_starting_pos = p1->second->attr("dest_starting_pos").str() == "yes";
-		p.automatic = wml::get_bool(p1->second, "automatic", true);
-		p.transition = p1->second->attr("transition");
+		p.area = rect(portal_node["rect"]);
+		p.level_dest = portal_node["level"].as_string();
+		p.dest = point(portal_node["dest"].as_string());
+		p.dest_starting_pos = portal_node["dest_starting_post"].as_bool(false);
+		p.automatic = portal_node["automatic"].as_bool(true);
+		p.transition = portal_node["transition"].as_string();
 		portals_.push_back(p);
 	}
 
-	if(node->has_attr("next_level")) {
-		right_portal_.level_dest = node->attr("next_level");
+	if(node.has_key("next_level")) {
+		right_portal_.level_dest = node["next_level"].as_string();
 		right_portal_.dest_str = "left";
 		right_portal_.dest_starting_pos = false;
 		right_portal_.automatic = true;
 	}
 
-	if(node->has_attr("previous_level")) {
-		left_portal_.level_dest = node->attr("previous_level");
+	if(node.has_key("previous_level")) {
+		left_portal_.level_dest = node["previous_level"].as_string();
 		left_portal_.dest_str = "right";
 		left_portal_.dest_starting_pos = false;
 		left_portal_.automatic = true;
 	}
 
-	wml::const_node_ptr bg = node->get_child("background");
-	if(bg) {
+	variant bg = node["background"];
+	if(bg.is_map()) {
 		background_.reset(new background(bg, background_palette_));
-	} else if(node->has_attr("background")) {
-		background_ = background::get(node->attr("background"), background_palette_);
-		background_offset_ = point(node->attr("background_offset"));
+	} else if(node.has_key("background")) {
+		background_ = background::get(node["background"].as_string(), background_palette_);
+		background_offset_ = point(node["background_offset"]);
 		background_->set_offset(background_offset_);
 	}
 
-	wml::const_node_ptr water_node = node->get_child("water");
-	if(water_node) {
-		water_.reset(new water(water_node));
+	if(node.has_key("water")) {
+		water_.reset(new water(node["water"]));
 	}
 
-	FOREACH_WML_CHILD(script_node, node, "script") {
+	foreach(variant script_node, node["script"].as_list()) {
 		movement_script s(script_node);
 		movement_scripts_[s.id()] = s;
 	}
 
-	const int time_taken_ms = (SDL_GetTicks() - start_time);
-	stats::record_event(id(), stats::const_record_ptr(new stats::load_level_record(time_taken_ms)));
-	std::cerr << "done level constructor: " << time_taken_ms << "\n";
+	if(node.has_key("gui")) {
+		if(node["gui"].is_string()) {
+			gui_algo_str_.push_back(node["gui"].as_string());
+		} else if(node["gui"].is_list()) {
+			gui_algo_str_ = node["gui"].as_list_string();
+		} else {
+			ASSERT_LOG(false, "Unexpected type error for gui node " << level_cfg);
+		}
+	} else {
+		gui_algo_str_.push_back("default");
+	}
 
-	gui_algo_str_ = wml::get_str(node, "gui", "default");
-	gui_algorithm_ = gui_algorithm::get(gui_algo_str_);
-	gui_algorithm_->new_level();
+	foreach(const std::string& s, gui_algo_str_) {
+		gui_algorithm_.push_back(gui_algorithm::get(s));
+		gui_algorithm_.back()->new_level();
+	}
 
-	sub_level_str_ = node->attr("sub_levels");
-	foreach(const std::string& sub_lvl, util::split(node->attr("sub_levels"))) {
+	sub_level_str_ = node["sub_levels"].as_string_default();
+	foreach(const std::string& sub_lvl, util::split(sub_level_str_)) {
 		sub_level_data& data = sub_levels_[sub_lvl];
 		data.lvl = boost::intrusive_ptr<level>(new level(sub_lvl + ".cfg"));
 		foreach(int layer, data.lvl->layers_) {
@@ -422,21 +413,24 @@ level::level(const std::string& level_cfg)
 		data.xbase = data.ybase = 0;
 	}
 
+	const int time_taken_ms = (SDL_GetTicks() - start_time);
+	stats::entry("load", id()).set("time", variant(time_taken_ms));
+	std::cerr << "done level constructor: " << time_taken_ms << "\n";
 }
 
 level::~level()
 {
 }
 
-void level::read_compiled_tiles(wml::const_node_ptr node, std::vector<level_tile>::iterator& out)
+void level::read_compiled_tiles(variant node, std::vector<level_tile>::iterator& out)
 {
-	const int xbase = wml::get_int(node, "x");
-	const int ybase = wml::get_int(node, "y");
-	const int zorder = wml::get_int(node, "zorder");
+	const int xbase = node["x"].as_int();
+	const int ybase = node["y"].as_int();
+	const int zorder = node["zorder"].as_int();
 
 	int x = xbase;
 	int y = ybase;
-	const std::string& tiles = node->attr("tiles");
+	const std::string& tiles = node["tiles"].as_string();
 	const char* i = tiles.c_str();
 	const char* end = tiles.c_str() + tiles.size();
 	while(i != end) {
@@ -464,14 +458,14 @@ void level::read_compiled_tiles(wml::const_node_ptr node, std::vector<level_tile
 
 			ASSERT_LOG(end - i >= 3, "ILLEGAL TILE FOUND");
 
-			out->object = level_object::get_compiled(i);
+			out->object = level_object::get_compiled(i).get();
 			++out;
 			i += 3;
 		}
 	}
 }
 
-void level::load_character(wml::const_node_ptr c)
+void level::load_character(variant c)
 {
 	chars_.push_back(entity::build(c));
 	layers_.insert(chars_.back()->zorder());
@@ -568,13 +562,9 @@ void level::finish_loading()
 
 	{
 	game_logic::wml_formula_callable_read_scope read_scope;
-	foreach(wml::const_node_ptr node, wml_chars_) {
-		if(node->name() != "serialized_objects") {
-			continue;
-		}
-
-		FOREACH_WML_CHILD(obj_node, node, "character") {
-			const intptr_t addr_id = strtoll(obj_node->attr("_addr").c_str(), NULL, 16);
+	foreach(variant node, serialized_objects_) {
+		foreach(variant obj_node, node["character"].as_list()) {
+			const intptr_t addr_id = strtoll(obj_node["_addr"].as_string().c_str(), NULL, 16);
 			entity_ptr obj(entity::build(obj_node));
 			objects_not_in_level.push_back(obj);
 			game_logic::wml_formula_callable_read_scope::register_serialized_object(addr_id, obj);
@@ -582,20 +572,16 @@ void level::finish_loading()
 		}
 	}
 
-	foreach(wml::const_node_ptr node, wml_chars_) {
-		if(node->name() == "serialized_objects") {
-			continue;
-		}
-
+	foreach(variant node, wml_chars_) {
 		load_character(node);
 
-		const intptr_t addr_id = strtoll(node->attr("_addr").c_str(), NULL, 16);
+		const intptr_t addr_id = strtoll(node["_addr"].as_string().c_str(), NULL, 16);
 		game_logic::wml_formula_callable_read_scope::register_serialized_object(addr_id, chars_.back());
 
-		if(node->has_attr("attached_objects")) {
-			std::cerr << "LOADING ATTACHED: " << node->attr("attached_objects") << "\n";
+		if(node.has_key("attached_objects")) {
+			std::cerr << "LOADING ATTACHED: " << node["attached_objects"].as_string() << "\n";
 			std::vector<entity_ptr> attached;
-			std::vector<std::string> v = util::split(node->attr("attached_objects"));
+			std::vector<std::string> v = util::split(node["attached_objects"].as_string());
 			foreach(const std::string& s, v) {
 				std::cerr << "ATTACHED: " << s << "\n";
 				const intptr_t addr_id = strtoll(s.c_str(), NULL, 16);
@@ -614,6 +600,7 @@ void level::finish_loading()
 	game_logic::set_verbatim_string_expressions (false);
 
 	wml_chars_.clear();
+	serialized_objects_.clear();
 
 	controls::new_level(cycle_, players_.empty() ? 1 : players_.size(), multiplayer::slot());
 
@@ -691,114 +678,138 @@ namespace {
 //the level we're currently building tiles for.
 const level* level_building = NULL;
 
-//record whether we are currently rebuilding tiles, and if we have had
-//another request come in during the current building of tiles.
-bool tile_rebuild_in_progress = false;
-bool tile_rebuild_queued = false;
+struct level_tile_rebuild_info {
+	level_tile_rebuild_info() : tile_rebuild_in_progress(false),
+	                            tile_rebuild_queued(false),
+								rebuild_tile_thread(NULL),
+								tile_rebuild_complete(false)
+	{}
 
-threading::thread* rebuild_tile_thread = NULL;
+	//record whether we are currently rebuilding tiles, and if we have had
+	//another request come in during the current building of tiles.
+	bool tile_rebuild_in_progress;
+	bool tile_rebuild_queued;
 
-//an unsynchronized buffer only accessed by the main thread with layers
-//that will be rebuilt.
-std::vector<int> rebuild_tile_layers_buffer;
+	threading::thread* rebuild_tile_thread;
 
-//buffer accessed by the worker thread which contains layers that will
-//be rebuilt.
-std::vector<int> rebuild_tile_layers_worker_buffer;
+	//an unsynchronized buffer only accessed by the main thread with layers
+	//that will be rebuilt.
+	std::vector<int> rebuild_tile_layers_buffer;
 
-//a locked flag which is polled to see if tile rebuilding has been completed.
-bool tile_rebuild_complete = false;
-threading::mutex& tile_rebuild_complete_mutex() {
-	static threading::mutex m;
-	return m;
-}
+	//buffer accessed by the worker thread which contains layers that will
+	//be rebuilt.
+	std::vector<int> rebuild_tile_layers_worker_buffer;
 
-//the tiles where the thread will store the new tiles.
-std::vector<level_tile> task_tiles;
+	//a locked flag which is polled to see if tile rebuilding has been completed.
+	bool tile_rebuild_complete;
 
-void build_tiles_thread_function(std::map<int, tile_map> tile_maps) {
-	task_tiles.clear();
+	threading::mutex tile_rebuild_complete_mutex;
 
-	if(rebuild_tile_layers_worker_buffer.empty()) {
+	//the tiles where the thread will store the new tiles.
+	std::vector<level_tile> task_tiles;
+};
+
+std::map<const level*, level_tile_rebuild_info> tile_rebuild_map;
+
+void build_tiles_thread_function(level_tile_rebuild_info* info, std::map<int, tile_map> tile_maps, threading::mutex& sync) {
+	info->task_tiles.clear();
+
+	if(info->rebuild_tile_layers_worker_buffer.empty()) {
 		for(std::map<int, tile_map>::const_iterator i = tile_maps.begin();
 		    i != tile_maps.end(); ++i) {
-			i->second.build_tiles(&task_tiles);
+			i->second.build_tiles(&info->task_tiles);
 		}
 	} else {
-		foreach(int layer, rebuild_tile_layers_worker_buffer) {
+		foreach(int layer, info->rebuild_tile_layers_worker_buffer) {
 			std::map<int, tile_map>::const_iterator itor = tile_maps.find(layer);
 			if(itor != tile_maps.end()) {
-				itor->second.build_tiles(&task_tiles);
+				itor->second.build_tiles(&info->task_tiles);
 			}
 		}
 	}
 
-	threading::lock l(tile_rebuild_complete_mutex());
-	tile_rebuild_complete = true;
+	threading::lock l(info->tile_rebuild_complete_mutex);
+	info->tile_rebuild_complete = true;
 }
 
 }
 
 void level::start_rebuild_tiles_in_background(const std::vector<int>& layers)
 {
+	level_tile_rebuild_info& info = tile_rebuild_map[this];
+
 	//merge the new layers with any layers we already have queued up.
-	if(layers.empty() == false && (!tile_rebuild_queued || rebuild_tile_layers_buffer.empty() == false)) {
+	if(layers.empty() == false && (!info.tile_rebuild_queued || info.rebuild_tile_layers_buffer.empty() == false)) {
 		//add the layers we want to rebuild to those already requested.
-		rebuild_tile_layers_buffer.insert(rebuild_tile_layers_buffer.end(), layers.begin(), layers.end());
-		std::sort(rebuild_tile_layers_buffer.begin(), rebuild_tile_layers_buffer.end());
-		rebuild_tile_layers_buffer.erase(std::unique(rebuild_tile_layers_buffer.begin(), rebuild_tile_layers_buffer.end()), rebuild_tile_layers_buffer.end());
+		info.rebuild_tile_layers_buffer.insert(info.rebuild_tile_layers_buffer.end(), layers.begin(), layers.end());
+		std::sort(info.rebuild_tile_layers_buffer.begin(), info.rebuild_tile_layers_buffer.end());
+		info.rebuild_tile_layers_buffer.erase(std::unique(info.rebuild_tile_layers_buffer.begin(), info.rebuild_tile_layers_buffer.end()), info.rebuild_tile_layers_buffer.end());
 	} else if(layers.empty()) {
-		rebuild_tile_layers_buffer.clear();
+		info.rebuild_tile_layers_buffer.clear();
 	}
 
-	if(tile_rebuild_in_progress) {
-		tile_rebuild_queued = true;
+	if(info.tile_rebuild_in_progress) {
+		info.tile_rebuild_queued = true;
 		return;
 	}
 
-	level_building = this;
+	info.tile_rebuild_in_progress = true;
+	info.tile_rebuild_complete = false;
 
-	tile_rebuild_in_progress = true;
-	tile_rebuild_complete = false;
+	info.rebuild_tile_layers_worker_buffer = info.rebuild_tile_layers_buffer;
+	info.rebuild_tile_layers_buffer.clear();
 
-	rebuild_tile_layers_worker_buffer = rebuild_tile_layers_buffer;
-	rebuild_tile_layers_buffer.clear();
+	static threading::mutex* sync = new threading::mutex;
 
-	rebuild_tile_thread = new threading::thread(boost::bind(build_tiles_thread_function, tile_maps_));
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+	info.rebuild_tile_thread = new threading::thread("rebuild_tiles", boost::bind(build_tiles_thread_function, &info, tile_maps_, *sync));
+#else
+	info.rebuild_tile_thread = new threading::thread(boost::bind(build_tiles_thread_function, &info, tile_maps_, *sync));
+#endif
 }
 
 void level::freeze_rebuild_tiles_in_background()
 {
-	tile_rebuild_in_progress = true;
+	level_tile_rebuild_info& info = tile_rebuild_map[this];
+	info.tile_rebuild_in_progress = true;
 }
 
 void level::unfreeze_rebuild_tiles_in_background()
 {
-	if(rebuild_tile_thread != NULL) {
+	level_tile_rebuild_info& info = tile_rebuild_map[this];
+	if(info.rebuild_tile_thread != NULL) {
 		//a thread is actually in flight calculating tiles, so any requests
 		//would have been queued up anyway.
 		return;
 	}
 
-	tile_rebuild_in_progress = false;
-	start_rebuild_tiles_in_background(rebuild_tile_layers_buffer);
+	info.tile_rebuild_in_progress = false;
+	start_rebuild_tiles_in_background(info.rebuild_tile_layers_buffer);
 }
 
 namespace {
 bool level_tile_from_layer(const level_tile& t, int zorder) {
 	return t.layer_from == zorder;
 }
+
+int g_tile_rebuild_state_id;
+}
+
+int level::tile_rebuild_state_id()
+{
+	return g_tile_rebuild_state_id;
 }
 
 void level::complete_rebuild_tiles_in_background()
 {
-	if(!tile_rebuild_in_progress) {
+	level_tile_rebuild_info& info = tile_rebuild_map[this];
+	if(!info.tile_rebuild_in_progress) {
 		return;
 	}
 
 	{
-		threading::lock l(tile_rebuild_complete_mutex());
-		if(!tile_rebuild_complete) {
+		threading::lock l(info.tile_rebuild_complete_mutex);
+		if(!info.tile_rebuild_complete) {
 			return;
 		}
 	}
@@ -806,33 +817,33 @@ void level::complete_rebuild_tiles_in_background()
 	const int begin_time = SDL_GetTicks();
 
 //	ASSERT_LOG(rebuild_tile_thread, "REBUILD TILE THREAD IS NULL");
-	delete rebuild_tile_thread;
-	rebuild_tile_thread = NULL;
+	delete info.rebuild_tile_thread;
+	info.rebuild_tile_thread = NULL;
 
-	if(level_building == this) {
-		if(rebuild_tile_layers_worker_buffer.empty()) {
-			tiles_.clear();
-		} else {
-			foreach(int layer, rebuild_tile_layers_worker_buffer) {
-				tiles_.erase(std::remove_if(tiles_.begin(), tiles_.end(), boost::bind(level_tile_from_layer, _1, layer)), tiles_.end());
-			}
+	if(info.rebuild_tile_layers_worker_buffer.empty()) {
+		tiles_.clear();
+	} else {
+		foreach(int layer, info.rebuild_tile_layers_worker_buffer) {
+			tiles_.erase(std::remove_if(tiles_.begin(), tiles_.end(), boost::bind(level_tile_from_layer, _1, layer)), tiles_.end());
 		}
-
-		tiles_.insert(tiles_.end(), task_tiles.begin(), task_tiles.end());
-		task_tiles.clear();
-
-		complete_tiles_refresh();
 	}
+
+	tiles_.insert(tiles_.end(), info.task_tiles.begin(), info.task_tiles.end());
+	info.task_tiles.clear();
+
+	complete_tiles_refresh();
 
 	std::cerr << "COMPLETE TILE REBUILD: " << (SDL_GetTicks() - begin_time) << "\n";
 
-	rebuild_tile_layers_worker_buffer.clear();
+	info.rebuild_tile_layers_worker_buffer.clear();
 
-	tile_rebuild_in_progress = false;
-	if(tile_rebuild_queued) {
-		tile_rebuild_queued = false;
-		start_rebuild_tiles_in_background(rebuild_tile_layers_buffer);
+	info.tile_rebuild_in_progress = false;
+	if(info.tile_rebuild_queued) {
+		info.tile_rebuild_queued = false;
+		start_rebuild_tiles_in_background(info.rebuild_tile_layers_buffer);
 	}
+
+	++g_tile_rebuild_state_id;
 }
 
 void level::rebuild_tiles()
@@ -952,82 +963,85 @@ std::string level::package() const
 	return std::string(id_.begin(), i);
 }
 
-wml::node_ptr level::write() const
+variant level::write() const
 {
 	std::sort(tiles_.begin(), tiles_.end(), level_tile_zorder_pos_comparer());
 	game_logic::wml_formula_callable_serialization_scope serialization_scope;
 
-	wml::node_ptr res(new wml::node("level"));
-	res->set_attr("id", id_);
-	res->set_attr("version", preferences::version());
-	res->set_attr("title", title_);
-	res->set_attr("music", music_);
-	res->set_attr("segment_width", formatter() << segment_width_);
-	res->set_attr("segment_height", formatter() << segment_height_);
+	variant_builder res;
+	res.add("id", id_);
+	res.add("version", preferences::version());
+	res.add("title", title_);
+	res.add("music", music_);
+	res.add("segment_width", segment_width_);
+	res.add("segment_height", segment_height_);
 
 	if(x_resolution_ || y_resolution_) {
-		res->set_attr("x_resolution", formatter() << x_resolution_);
-		res->set_attr("y_resolution", formatter() << y_resolution_);
+		res.add("x_resolution", x_resolution_);
+		res.add("y_resolution", y_resolution_);
 	}
 
-	if(gui_algo_str_ != "default") {
-		res->set_attr("gui", gui_algo_str_);
+	if(!gui_algo_str_.empty() && !(gui_algo_str_.front() == "default" && gui_algo_str_.size() == 1)) {
+		foreach(std::string gui_str, gui_algo_str_) {
+			res.add("gui", gui_str);
+		}
 	}
 
 	if(dark_) {
-		res->set_attr("dark", "yes");
+		res.add("dark", true);
 	}
 
 	if(dark_color_.to_string() != default_dark_color().to_string()) {
-		res->set_attr("dark_color", dark_color_.to_string());
+		res.add("dark_color", dark_color_.write());
 	}
 
 	if(cycle_) {
-		res->set_attr("cycle", formatter() << cycle_);
+		res.add("cycle", cycle_);
 	}
 
 	if(!sub_level_str_.empty()) {
-		res->set_attr("sub_levels", sub_level_str_);
+		res.add("sub_levels", sub_level_str_);
 	}
 
-	res->set_attr("dimensions", boundaries().to_string());
+	res.add("dimensions", boundaries().write());
 
-	res->set_attr("xscale", formatter() << xscale_);
-	res->set_attr("yscale", formatter() << yscale_);
-	res->set_attr("auto_move_camera", auto_move_camera_.to_string());
-	res->set_attr("air_resistance", formatter() << air_resistance_);
-	res->set_attr("water_resistance", formatter() << water_resistance_);
+	res.add("xscale", xscale_);
+	res.add("yscale", yscale_);
+	res.add("auto_move_camera", auto_move_camera_.write());
+	res.add("air_resistance", air_resistance_);
+	res.add("water_resistance", water_resistance_);
 
-	res->set_attr("preloads", util::join(preloads_));
+	res.add("preloads", util::join(preloads_));
 
 	if(lock_screen_) {
-		res->set_attr("lock_screen", lock_screen_->to_string());
+		res.add("lock_screen", lock_screen_->to_string());
 	}
 
 	if(water_) {
-		res->add_child(water_->write());
+		res.add("water", water_->write());
 	}
 
 	if(camera_rotation_) {
-		res->set_attr("camera_rotation", camera_rotation_->str());
+		res.add("camera_rotation", camera_rotation_->str());
 	}
 
 	foreach(const solid_rect& r, solid_rects_) {
-		wml::node_ptr node(new wml::node("solid_rect"));
-		node->set_attr("rect", r.r.to_string());
-		node->set_attr("friction", formatter() << r.friction);
-		node->set_attr("traction", formatter() << r.traction);
-		node->set_attr("damage", formatter() << r.damage);
-		res->add_child(node);
+		variant_builder node;
+		node.add("rect", r.r.write());
+		node.add("friction", r.friction);
+		node.add("traction", r.traction);
+		node.add("damage", r.damage);
+
+		res.add("solid_rect", node.build());
 	}
 
 	for(std::map<int, tile_map>::const_iterator i = tile_maps_.begin(); i != tile_maps_.end(); ++i) {
-		wml::node_ptr node(i->second.write());
+		variant node = i->second.write();
 		if(preferences::compiling_tiles) {
-			node->set_attr("tiles", "");
-			node->set_attr("unique_tiles", "");
+			node.add_attr(variant("tiles"), variant(""));
+			node.add_attr(variant("unique_tiles"), variant(""));
 		}
-		res->add_child(node);
+		res.add("tile_map", node);
 	}
 
 	if(preferences::compiling_tiles && !tiles_.empty()) {
@@ -1046,12 +1060,12 @@ wml::node_ptr level::write() const
 
 			if(n == tiles_.size() || tiles_[n].zorder != last_zorder) {
 				if(!tiles_str.empty()) {
-					wml::node_ptr node(new wml::node("compiled_tiles"));
-					node->set_attr("zorder", formatter() << last_zorder);
-					node->set_attr("x", formatter() << basex);
-					node->set_attr("y", formatter() << basey);
-					node->set_attr("tiles", tiles_str);
-					res->add_child(node);
+					variant_builder node;
+					node.add("zorder", last_zorder);
+					node.add("x", basex);
+					node.add("y", basey);
+					node.add("tiles", tiles_str);
+					res.add("compiled_tiles", node.build());
 				}
 
 				if(n == tiles_.size()) {
@@ -1118,7 +1132,7 @@ wml::node_ptr level::write() const
 			last_x += TileSize;
 		}
 
-		res->set_attr("num_compiled_tiles", formatter() << num_tiles);
+		res.add("num_compiled_tiles", num_tiles);
 
 		//calculate rectangular opaque areas of tiles that allow us
 		//to avoid drawing the background. Start by calculating the set
@@ -1224,7 +1238,7 @@ wml::node_ptr level::write() const
 				opaque_rects_str << r.to_string() << ":";
 			}
 
-			res->set_attr("opaque_rects", opaque_rects_str.str());
+			res.add("opaque_rects", opaque_rects_str.str());
 
 			std::cerr << "RECTS: " << id_ << ": " << opaque_rects.size() << "\n";
 		}
@@ -1235,50 +1249,48 @@ wml::node_ptr level::write() const
 			continue;
 		}
 
-		wml::node_ptr node(ch->write());
-		res->add_child(node);
+		variant node(ch->write());
 		game_logic::wml_formula_callable_serialization_scope::register_serialized_object(ch, node);
+		res.add("character", node);
 	}
 
 	foreach(const portal& p, portals_) {
-		wml::node_ptr node(new wml::node("portal"));
-		node->set_attr("rect", p.area.to_string());
-		node->set_attr("level", p.level_dest);
-		node->set_attr("dest_starting_pos", p.dest_starting_pos ? "yes" : "no");
-		node->set_attr("dest", p.dest.to_string());
-		node->set_attr("automatic", p.automatic ? "yes" : "no");
-		node->set_attr("transition", p.transition);
-		res->add_child(node);
+		variant_builder node;
+		node.add("rect", p.area.write());
+		node.add("level", p.level_dest);
+		node.add("dest_starting_pos", p.dest_starting_pos);
+		node.add("dest", p.dest.to_string());
+		node.add("automatic", p.automatic);
+		node.add("transition", p.transition);
+		res.add("portal", node.build());
 	}
 
 	if(right_portal_.level_dest.empty() == false) {
-		res->set_attr("next_level", right_portal_.level_dest);
+		res.add("next_level", right_portal_.level_dest);
 	}
 
 	std::cerr << "PREVIOUS LEVEL: " << left_portal_.level_dest << "\n";
 	if(left_portal_.level_dest.empty() == false) {
-		res->set_attr("previous_level", left_portal_.level_dest);
+		res.add("previous_level", left_portal_.level_dest);
 	}
 
 	if(background_) {
 		if(background_->id().empty()) {
-			res->add_child(background_->write());
+			res.add("background", background_->write());
 		} else {
-			res->set_attr("background", background_->id());
-			res->set_attr("background_offset", background_offset_.to_string());
+			res.add("background", background_->id());
+			res.add("background_offset", background_offset_.write());
 		}
 	}
 
 	for(std::map<std::string, movement_script>::const_iterator i = movement_scripts_.begin(); i != movement_scripts_.end(); ++i) {
-		res->add_child(i->second.write());
+		res.add("script", i->second.write());
 	}
 
-	res->add_child(serialization_scope.write_objects());
-
 	if(num_compiled_tiles_ > 0) {
-		res->set_attr("num_compiled_tiles", formatter() << num_compiled_tiles_);
-		foreach(wml::node_ptr compiled_node, wml_compiled_tiles_) {
-			res->add_child(compiled_node);
+		res.add("num_compiled_tiles", num_compiled_tiles_);
+		foreach(variant compiled_node, wml_compiled_tiles_) {
+			res.add("compiled_tiles", compiled_node);
 		}
 	}
 
@@ -1295,26 +1307,18 @@ wml::node_ptr level::write() const
 			++id;
 		}
 
-		res->set_attr("palettes", util::join(out));
+		res.add("palettes", util::join(out));
 	}
 
 	if(background_palette_ != -1) {
-		res->set_attr("background_palette", graphics::get_palette_name(background_palette_));
+		res.add("background_palette", graphics::get_palette_name(background_palette_));
 	}
 
-	if(!vars_.empty()) {
-		wml::node_ptr vars(new wml::node("vars"));
-		for(std::map<std::string, variant>::const_iterator i = vars_.begin();
-		    i != vars_.end(); ++i) {
-			std::string value;
-			i->second.serialize_to_string(value);
-			vars->set_attr(i->first, value);
-		}
+	res.add("vars", vars_);
 
-		res->add_child(vars);
-	}
-
-	return res;
+	variant result = res.build();
+	result.add_attr(variant("serialized_objects"), serialization_scope.write_objects(result));
+	return result;
 }
 
 point level::get_dest_from_str(const std::string& key) const
@@ -1372,14 +1376,14 @@ void level::draw_layer(int layer, int x, int y, int w, int h) const
 	for(std::map<std::string, sub_level_data>::const_iterator i = sub_levels_.begin(); i != sub_levels_.end(); ++i) {
 		if(i->second.active) {
 			glPushMatrix();
-			glTranslatef(i->second.xoffset, i->second.yoffset, 0.0);
+			glTranslatef(i->second.xoffset, GLfloat(i->second.yoffset), 0.0);
 			i->second.lvl->draw_layer(layer, x - i->second.xoffset, y - i->second.yoffset - TileSize, w, h + TileSize);
 			glPopMatrix();
 		}
 	}
 
 	if(editor_ && layer == highlight_layer_) {
-		const GLfloat alpha = 0.3 + (1.0+sin(draw_count/5.0))*0.35;
+		const GLfloat alpha = GLfloat(0.3 + (1.0+sin(draw_count/5.0))*0.35);
 		glColor4f(1.0, 1.0, 1.0, alpha);
 
 	} else if(editor_ && hidden_layers_.count(layer)) {
@@ -1563,6 +1567,8 @@ void level::prepare_tiles_for_drawing()
 			continue;
 		}
 
+		//in the editor we want to draw the whole level, so don't exclude
+		//things outside the level bounds.
 		if(!editor_ && (tiles_[n].x <= boundaries().x() - TileSize || tiles_[n].y <= boundaries().y() - TileSize || tiles_[n].x >= boundaries().x2() || tiles_[n].y >= boundaries().y2())) {
 			continue;
 		}
@@ -1675,7 +1681,7 @@ void level::prepare_tiles_for_drawing()
 namespace {
 bool sort_entity_drawing_pos(const entity_ptr& a, const entity_ptr& b) {
 	//the reverse_global_vertical_zordering flag is set in the player object (our general repository for all major game rules et al).  It's meant to reverse vertical sorting of objects in the same zorder, depending on whether objects are being viewed from above, or below.  In frogatto proper, objects at a higher vertical position should overlap those below.  In a top-down game, the reverse is desirable.
-	if(level::current().player()->reverse_global_vertical_zordering()){
+	if(level::current().player() && level::current().player()->reverse_global_vertical_zordering()){
 			return a->zorder() < b->zorder() ||
 			a->zorder() == b->zorder() && a->zsub_order() < b->zsub_order() ||
 			a->zorder() == b->zorder() && a->zsub_order() == b->zsub_order() && a->midpoint().y < b->midpoint().y ||
@@ -1692,8 +1698,10 @@ bool sort_entity_drawing_pos(const entity_ptr& a, const entity_ptr& b) {
 
 void level::draw_status() const
 {
-	if(gui_algorithm_) {
-		gui_algorithm_->draw(*this);
+	if(!gui_algorithm_.empty()) {
+		foreach(gui_algorithm_ptr g, gui_algorithm_) {
+			g->draw(*this);
+		}
 		iphone_controls::draw();
 	}
 
@@ -1749,15 +1757,26 @@ void level::draw(int x, int y, int w, int h) const
 
 	const std::vector<entity_ptr>* chars_ptr = &active_chars_;
 	std::vector<entity_ptr> editor_chars_buf;
+	
 	if(editor_) {
-		//in the editor we draw all chars, not just active chars. We also
-		//sort the chars by drawing order to make sure they are drawn in
-		//the correct order.
-		editor_chars_buf = chars_;
+		editor_chars_buf = active_chars_;
+		rect screen_area(x, y, w, h);
+
+		//in the editor draw all characters that are on screen as well
+		//as active ones.
+		foreach(const entity_ptr& c, chars_) {
+			if(std::find(editor_chars_buf.begin(), editor_chars_buf.end(), c) != editor_chars_buf.end()) {
+				continue;
+			}
+
+			if(std::find(active_chars_.begin(), active_chars_.end(), c) != active_chars_.end() || rects_intersect(c->draw_rect(), screen_area)) {
+				editor_chars_buf.push_back(c);
+			}
+		}
+
 		std::sort(editor_chars_buf.begin(), editor_chars_buf.end(), sort_entity_drawing_pos);
 		chars_ptr = &editor_chars_buf;
 	}
-
 	const std::vector<entity_ptr>& chars = *chars_ptr;
 
 	std::vector<entity_ptr>::const_iterator entity_itor = chars.begin();
@@ -1819,16 +1838,28 @@ void level::draw(int x, int y, int w, int h) const
 	}
 
 	if(editor_highlight_ || !editor_selection_.empty()) {
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-		const GLfloat alpha = 0.5 + sin(draw_count/5.0)*0.5;
-		glColor4f(1.0, 1.0, 1.0, alpha);
-
-		if(editor_highlight_) {
+		if(editor_highlight_ && std::count(chars_.begin(), chars_.end(), editor_highlight_)) {
 			draw_entity(*editor_highlight_, x, y, true);
 		}
 
 		foreach(const entity_ptr& e, editor_selection_) {
-			draw_entity(*e, x, y, true);
+			if(std::count(chars_.begin(), chars_.end(), e)) {
+				draw_entity(*e, x, y, true);
+			}
+		}
+
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+		const GLfloat alpha = 0.5 + sin(draw_count/5.0)*0.5;
+		glColor4f(1.0, 1.0, 1.0, alpha);
+
+		if(editor_highlight_ && std::count(chars_.begin(), chars_.end(), editor_highlight_)) {
+			draw_entity(*editor_highlight_, x, y, true);
+		}
+
+		foreach(const entity_ptr& e, editor_selection_) {
+			if(std::count(chars_.begin(), chars_.end(), e)) {
+				draw_entity(*e, x, y, true);
+			}
 		}
 
 		glColor4f(1.0, 1.0, 1.0, 1.0);
@@ -1875,15 +1906,20 @@ void level::calculate_lighting(int x, int y, int w, int h) const
 	//now blit the light buffer onto the screen
 	texture_frame_buffer::set_as_current_texture();
 
+	glPushMatrix();
+	glLoadIdentity();
+
 	const GLfloat tcarray[] = { 0, 0, 0, 1, 1, 0, 1, 1 };
 	const GLfloat tcarray_rotated[] = { 0, 1, 1, 1, 0, 0, 1, 0 };
-	GLfloat varray[] = { x, y + h, x, y, x + w, y + h, x + w, y };
+	GLfloat varray[] = { 0, h, 0, 0, w, h, w, 0 };
 	glVertexPointer(2, GL_FLOAT, 0, varray);
 	glTexCoordPointer(2, GL_FLOAT, 0,
 	               preferences::screen_rotated() ? tcarray_rotated : tcarray);
 	glBlendFunc(GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	glPopMatrix();
 }
 
 void level::draw_debug_solid(int x, int y, int w, int h) const
@@ -1907,7 +1943,7 @@ void level::draw_debug_solid(int x, int y, int w, int h) const
 			const int ypixel = (tile_y + ypos)*TileSize;
 
 			if(info->all_solid) {
-				graphics::draw_rect(rect(xpixel, ypixel, TileSize, TileSize), info->damage ? graphics::color(255, 0, 0, 196) : graphics::color(255, 255, 255, 196));
+				graphics::draw_rect(rect(xpixel, ypixel, TileSize, TileSize), info->info.damage ? graphics::color(255, 0, 0, 196) : graphics::color(255, 255, 255, 196));
 			} else {
 				std::vector<GLshort> v;
 				glDisable(GL_TEXTURE_2D);
@@ -1922,7 +1958,7 @@ void level::draw_debug_solid(int x, int y, int w, int h) const
 				}
 
 				if(!v.empty()) {
-					if(info->damage) {
+					if(info->info.damage) {
 						glColor4ub(255, 0, 0, 196);
 					} else {
 						glColor4ub(255, 255, 255, 196);
@@ -1958,7 +1994,14 @@ void level::draw_background(int x, int y, int rotation) const
 	if(background_) {
 		static std::vector<rect> opaque_areas;
 		opaque_areas.clear();
-		rect screen_area(x, y, graphics::screen_width(), graphics::screen_height());
+		int screen_width = graphics::screen_width();
+		int screen_height = graphics::screen_height();
+		if(zoom_level_ < 1.0) {
+			screen_width /= zoom_level_.as_float();
+			screen_height /= zoom_level_.as_float();
+		}
+
+		rect screen_area(x, y, screen_width, screen_height);
 		foreach(const rect& r, opaque_rects_) {
 			if(rects_intersect(r, screen_area)) {
 
@@ -1991,8 +2034,10 @@ void level::draw_background(int x, int y, int rotation) const
 
 void level::process()
 {
-	if(gui_algorithm_) {
-		gui_algorithm_->process(*this);
+	if(!gui_algorithm_.empty()) {
+		foreach(gui_algorithm_ptr g, gui_algorithm_) {
+			g->process(*this);
+		}
 	}
 
 	const int LevelPreloadFrequency = 500; //10 seconds
@@ -2026,36 +2071,24 @@ void level::process_draw()
 
 namespace {
 bool compare_entity_num_parents(const entity_ptr& a, const entity_ptr& b) {
-	return a->parent_depth() < b->parent_depth();
+	const int deptha = a->parent_depth();
+	const int depthb = b->parent_depth();
+	const bool standa = a->standing_on().get() ? true : false;
+	const bool standb = b->standing_on().get() ? true : false;
+	return deptha < depthb || deptha == depthb && standa < standb ||
+	     deptha == depthb && standa == standb && a->is_human() < b->is_human();
 }
 }
 
-void level::do_processing()
+void level::set_active_chars()
 {
-	if(cycle_ == 0) {
-		const std::vector<entity_ptr> chars = chars_;
-		foreach(const entity_ptr& e, chars) {
-			e->handle_event(OBJECT_EVENT_START_LEVEL);
-		}
-	}
-
-	++cycle_;
-
-	const int ticks = SDL_GetTicks();
-	detect_user_collisions(*this);
-	active_chars_.clear();
-
-	if(!player_) {
-		return;
-	}
-
 	const int screen_left = last_draw_position().x/100;
 	const int screen_right = last_draw_position().x/100 + graphics::screen_width();
 	const int screen_top = last_draw_position().y/100;
 	const int screen_bottom = last_draw_position().y/100 + graphics::screen_height();
 
 	const rect screen_area(screen_left, screen_top, screen_right - screen_left, screen_bottom - screen_top);
-
+	active_chars_.clear();
 	foreach(entity_ptr& c, chars_) {
 		const bool is_active = c->is_active(screen_area);
 
@@ -2084,6 +2117,26 @@ void level::do_processing()
 	std::sort(active_chars_.begin(), active_chars_.end());
 	active_chars_.erase(std::unique(active_chars_.begin(), active_chars_.end()), active_chars_.end());
 	std::sort(active_chars_.begin(), active_chars_.end(), sort_entity_drawing_pos);
+}
+
+void level::do_processing()
+{
+	if(cycle_ == 0) {
+		const std::vector<entity_ptr> chars = chars_;
+		foreach(const entity_ptr& e, chars) {
+			e->handle_event(OBJECT_EVENT_START_LEVEL);
+		}
+	}
+
+	++cycle_;
+	if(!player_) {
+		return;
+	}
+
+	const int ticks = SDL_GetTicks();
+	set_active_chars();
+	detect_user_collisions(*this);
+
 	
 /*
 	std::cerr << "SUMMARY " << cycle_ << ": ";
@@ -2110,7 +2163,7 @@ void level::do_processing()
 		active_chars = chars_immune_from_time_freeze_;
 	}
 	foreach(const entity_ptr& c, active_chars) {
-		if(!c->destroyed() || c->is_human()) {
+		if(!c->destroyed() && chars_by_label_.count(c->label()) || c->is_human()) {
 			c->process(*this);
 		}
 
@@ -2146,7 +2199,7 @@ void level::erase_char(entity_ptr c)
 	solid_chars_.clear();
 }
 
-bool level::is_solid(const level_solid_map& map, const entity& e, const std::vector<point>& points, int* friction, int* traction, int* damage) const
+bool level::is_solid(const level_solid_map& map, const entity& e, const std::vector<point>& points, const surface_info** surf_info) const
 {
 	const tile_solid_info* info = NULL;
 	int prev_x = INT_MIN, prev_y = INT_MIN;
@@ -2191,33 +2244,19 @@ bool level::is_solid(const level_solid_map& map, const entity& e, const std::vec
 
 		if(info != NULL) {
 			if(info->all_solid) {
-				if(friction) {
-					*friction = info->friction;
+				if(surf_info) {
+					*surf_info = &info->info;
 				}
 
-				if(traction) {
-					*traction = info->traction;
-				}
-
-				if(damage) {
-					*damage = info->damage;
-				}
 				return true;
 			}
 		
 			const int index = y*TileSize + x;
 			if(info->bitmap.test(index)) {
-				if(friction) {
-					*friction = info->friction;
+				if(surf_info) {
+					*surf_info = &info->info;
 				}
 
-				if(traction) {
-					*traction = info->traction;
-				}
-
-				if(damage) {
-					*damage = info->damage;
-				}
 				return true;
 			}
 		}
@@ -2229,7 +2268,7 @@ bool level::is_solid(const level_solid_map& map, const entity& e, const std::vec
 	return false;
 }
 
-bool level::is_solid(const level_solid_map& map, int x, int y, int* friction, int* traction, int* damage) const
+bool level::is_solid(const level_solid_map& map, int x, int y, const surface_info** surf_info) const
 {
 	tile_pos pos(x/TileSize, y/TileSize);
 	x = x%TileSize;
@@ -2247,33 +2286,19 @@ bool level::is_solid(const level_solid_map& map, int x, int y, int* friction, in
 	const tile_solid_info* info = map.find(pos);
 	if(info != NULL) {
 		if(info->all_solid) {
-			if(friction) {
-				*friction = info->friction;
+			if(surf_info) {
+				*surf_info = &info->info;
 			}
 
-			if(traction) {
-				*traction = info->traction;
-			}
-
-			if(damage) {
-				*damage = info->damage;
-			}
 			return true;
 		}
 		
 		const int index = y*TileSize + x;
 		if(info->bitmap.test(index)) {
-			if(friction) {
-				*friction = info->friction;
+			if(surf_info) {
+				*surf_info = &info->info;
 			}
 
-			if(traction) {
-				*traction = info->traction;
-			}
-
-			if(damage) {
-				*damage = info->damage;
-			}
 			return true;
 		} else {
 			return false;
@@ -2283,7 +2308,7 @@ bool level::is_solid(const level_solid_map& map, int x, int y, int* friction, in
 	return false;
 }
 
-bool level::standable(const rect& r, int* friction, int* traction, int* damage) const
+bool level::standable(const rect& r, const surface_info** info) const
 {
 	const int ybegin = r.y();
 	const int yend = r.y2();
@@ -2292,7 +2317,7 @@ bool level::standable(const rect& r, int* friction, int* traction, int* damage) 
 
 	for(int y = ybegin; y != yend; ++y) {
 		for(int x = xbegin; x != xend; ++x) {
-			if(standable(x, y, friction, traction, damage)) {
+			if(standable(x, y, info)) {
 				return true;
 			}
 		}
@@ -2301,20 +2326,18 @@ bool level::standable(const rect& r, int* friction, int* traction, int* damage) 
 	return false;
 }
 
-bool level::standable(int x, int y, int* friction, int* traction, int* damage) const
+bool level::standable(int x, int y, const surface_info** info) const
 {
-	if(is_solid(solid_, x, y, friction, traction, damage) ||
-	   is_solid(standable_, x, y, friction, traction, damage)) {
+	if(is_solid(solid_, x, y, info) || is_solid(standable_, x, y, info)) {
 	   return true;
 	}
 
 	return false;
 }
 
-bool level::standable_tile(int x, int y, int* friction, int* traction, int* damage) const
+bool level::standable_tile(int x, int y, const surface_info** info) const
 {
-	if(is_solid(solid_, x, y, friction, traction, damage) ||
-	   is_solid(standable_, x, y, friction, traction, damage)) {
+	if(is_solid(solid_, x, y, info) || is_solid(standable_, x, y, info)) {
 		return true;
 	}
 	
@@ -2322,17 +2345,17 @@ bool level::standable_tile(int x, int y, int* friction, int* traction, int* dama
 }
 
 
-bool level::solid(int x, int y, int* friction, int* traction, int* damage) const
+bool level::solid(int x, int y, const surface_info** info) const
 {
-	return is_solid(solid_, x, y, friction, traction, damage);
+	return is_solid(solid_, x, y, info);
 }
 
-bool level::solid(const entity& e, const std::vector<point>& points, int* friction, int* traction, int* damage) const
+bool level::solid(const entity& e, const std::vector<point>& points, const surface_info** info) const
 {
-	return is_solid(solid_, e, points, friction, traction, damage);
+	return is_solid(solid_, e, points, info);
 }
 
-bool level::solid(const rect& r, int* friction, int* traction, int* damage) const
+bool level::solid(const rect& r, const surface_info** info) const
 {
 	//TODO: consider optimizing this function.
 	const int ybegin = r.y();
@@ -2342,7 +2365,7 @@ bool level::solid(const rect& r, int* friction, int* traction, int* damage) cons
 
 	for(int y = ybegin; y != yend; ++y) {
 		for(int x = xbegin; x != xend; ++x) {
-			if(solid(x, y, friction, traction, damage)) {
+			if(solid(x, y, info)) {
 				return true;
 			}
 		}
@@ -2384,9 +2407,10 @@ bool level::may_be_solid_in_rect(const rect& r) const
 
 void level::set_solid_area(const rect& r, bool solid)
 {
+	std::string empty_info;
 	for(int y = r.y(); y < r.y2(); ++y) {
 		for(int x = r.x(); x < r.x2(); ++x) {
-			set_solid(solid_, x, y, 0, 0, 0, solid);
+			set_solid(solid_, x, y, 0, 0, 0, empty_info, solid);
 		}
 	}
 }
@@ -2448,7 +2472,7 @@ int round_tile_size(int n)
 	if(n >= 0) {
 		return n - n%TileSize;
 	} else {
-		n = -n + 31;
+		n = -n + 32;
 		return -(n - n%TileSize);
 	}
 }
@@ -2577,7 +2601,7 @@ void level::add_tile_solid(const level_tile& t)
 
 	const const_level_object_ptr& obj = t.object;
 	if(obj->all_solid()) {
-		add_solid_rect(t.x, t.y, t.x + obj->width(), t.y + obj->height(), obj->friction(), obj->traction(), obj->damage());
+		add_solid_rect(t.x, t.y, t.x + obj->width(), t.y + obj->height(), obj->friction(), obj->traction(), obj->damage(), obj->info());
 		return;
 	}
 
@@ -2590,9 +2614,9 @@ void level::add_tile_solid(const level_tile& t)
 				}
 				if(obj->is_solid(xpos, y)) {
 					if(obj->is_passthrough()) {
-						add_standable(t.x + x, t.y + y, obj->friction(), obj->traction(), obj->damage());
+						add_standable(t.x + x, t.y + y, obj->friction(), obj->traction(), obj->damage(), obj->info());
 					} else {
-						add_solid(t.x + x, t.y + y, obj->friction(), obj->traction(), obj->damage());
+						add_solid(t.x + x, t.y + y, obj->friction(), obj->traction(), obj->damage(), obj->info());
 					}
 				}
 			}
@@ -2677,20 +2701,19 @@ const level_tile* level::get_tile_at(int x, int y) const
 
 void level::remove_character(entity_ptr e)
 {
-	//std::cerr << "removing char: '" << e->label() << "'\n";
 	if(e->label().empty() == false) {
 		chars_by_label_.erase(e->label());
 	}
 	chars_.erase(std::remove(chars_.begin(), chars_.end(), e), chars_.end());
-	//std::cerr << "removed char: '" << e->label() << "'\n";
 }
 
 std::vector<entity_ptr> level::get_characters_in_rect(const rect& r, int screen_xpos, int screen_ypos) const
 {
 	std::vector<entity_ptr> res;
 	foreach(entity_ptr c, chars_) {
-		const int xP = c->x() + ((c->parallax_scale_millis_x() - 1000)*screen_xpos)/1000;
-		const int yP = c->y() + ((c->parallax_scale_millis_y() - 1000)*screen_ypos)/1000;
+
+		const int xP = c->midpoint().x + ((c->parallax_scale_millis_x() - 1000)*screen_xpos)/1000;
+		const int yP = c->midpoint().y + ((c->parallax_scale_millis_y() - 1000)*screen_ypos)/1000;
 		
 		if(point_in_rect(point(xP, yP), r)) {
 			res.push_back(c);
@@ -2739,13 +2762,13 @@ entity_ptr level::get_next_character_at_point(int x, int y, int screen_xpos, int
 	return *itor;
 }
 
-void level::add_solid_rect(int x1, int y1, int x2, int y2, int friction, int traction, int damage)
+void level::add_solid_rect(int x1, int y1, int x2, int y2, int friction, int traction, int damage, const std::string& info_str)
 {
 	if((x1%TileSize) != 0 || (y1%TileSize) != 0 ||
 	   (x2%TileSize) != 0 || (y2%TileSize) != 0) {
 		for(int y = y1; y < y2; ++y) {
 			for(int x = x1; x < x2; ++x) {
-				add_solid(x, y, friction, traction, damage);
+				add_solid(x, y, friction, traction, damage, info_str);
 			}
 		}
 
@@ -2757,29 +2780,33 @@ void level::add_solid_rect(int x1, int y1, int x2, int y2, int friction, int tra
 			tile_pos pos(x/TileSize, y/TileSize);
 			tile_solid_info& s = solid_.insert_or_find(pos);
 			s.all_solid = true;
-			s.friction = friction;
-			s.traction = traction;
+			s.info.friction = friction;
+			s.info.traction = traction;
 
-			if(s.damage >= 0) {
-				s.damage = std::min(s.damage, damage);
+			if(s.info.damage >= 0) {
+				s.info.damage = std::min(s.info.damage, damage);
 			} else {
-				s.damage = damage;
+				s.info.damage = damage;
+			}
+
+			if(info_str.empty() == false) {
+				s.info.info = surface_info::get_info_str(info_str);
 			}
 		}
 	}
 }
 
-void level::add_solid(int x, int y, int friction, int traction, int damage)
+void level::add_solid(int x, int y, int friction, int traction, int damage, const std::string& info)
 {
-	set_solid(solid_, x, y, friction, traction, damage);
+	set_solid(solid_, x, y, friction, traction, damage, info);
 }
 
-void level::add_standable(int x, int y, int friction, int traction, int damage)
+void level::add_standable(int x, int y, int friction, int traction, int damage, const std::string& info)
 {
-	set_solid(standable_, x, y, friction, traction, damage);
+	set_solid(standable_, x, y, friction, traction, damage, info);
 }
 
-void level::set_solid(level_solid_map& map, int x, int y, int friction, int traction, int damage, bool solid)
+void level::set_solid(level_solid_map& map, int x, int y, int friction, int traction, int damage, const std::string& info_str, bool solid)
 {
 	tile_pos pos(x/TileSize, y/TileSize);
 	x = x%TileSize;
@@ -2796,15 +2823,15 @@ void level::set_solid(level_solid_map& map, int x, int y, int friction, int trac
 	const int index = y*TileSize + x;
 	tile_solid_info& info = map.insert_or_find(pos);
 
-	if(info.damage >= 0) {
-		info.damage = std::min(info.damage, damage);
+	if(info.info.damage >= 0) {
+		info.info.damage = std::min(info.info.damage, damage);
 	} else {
-		info.damage = damage;
+		info.info.damage = damage;
 	}
 
 	if(solid) {
-		info.friction = friction;
-		info.traction = traction;
+		info.info.friction = friction;
+		info.info.traction = traction;
 		info.bitmap.set(index);
 	} else {
 		if(info.all_solid) {
@@ -2813,6 +2840,10 @@ void level::set_solid(level_solid_map& map, int x, int y, int friction, int trac
 		}
 
 		info.bitmap.reset(index);
+	}
+
+	if(info_str.empty() == false) {
+		info.info.info = surface_info::get_info_str(info_str);
 	}
 }
 
@@ -2847,7 +2878,6 @@ void level::add_player(entity_ptr p)
 	const std::vector<int>& destroyed_objects = player_->get_player_info()->get_objects_destroyed(id());
 	for(int n = 0; n != chars_.size(); ++n) {
 		if(chars_[n]->respawn() == false && std::binary_search(destroyed_objects.begin(), destroyed_objects.end(), chars_[n]->get_id())) {
-			std::cerr << "removing character: " << n << ": " << chars_[n]->get_id() << "\n";
 			if(chars_[n]->label().empty() == false) {
 				chars_by_label_.erase(chars_[n]->label());
 			}
@@ -2871,8 +2901,19 @@ void level::add_character(entity_ptr p)
 		solid_chars_.push_back(p);
 	}
 
+	ASSERT_LOG(p->label().empty() == false, "Entity has no label");
+
 	if(p->label().empty() == false) {
-		chars_by_label_[p->label()] = p;
+		entity_ptr& target = chars_by_label_[p->label()];
+		if(!target) {
+			target = p;
+		} else {
+			while(chars_by_label_[p->label()]) {
+				p->set_label(formatter() << p->label() << rand());
+			}
+
+			chars_by_label_[p->label()] = p;
+		}
 	}
 
 	if(p->is_human()) {
@@ -2882,6 +2923,11 @@ void level::add_character(entity_ptr p)
 	}
 
 	layers_.insert(p->zorder());
+}
+
+void level::add_draw_character(entity_ptr p)
+{
+	active_chars_.push_back(p);
 }
 
 void level::force_enter_portal(const portal& p)
@@ -2988,14 +3034,14 @@ namespace {
 const std::string LevelProperties[] = {
   "cycle", "player", "in_dialog",
   "local_player", "num_active", "active_chars", "chars", "players",
-  "in_editor", "zoom", "focus", "gui", "id", "dimensions",
+  "in_editor", "zoom", "focus", "gui", "id", "dimensions", "music_volume",
 };
 
 enum LEVEL_PROPERTY_ID {
 	LEVEL_CYCLE, LEVEL_PLAYER, LEVEL_IN_DIALOG,
 	LEVEL_LOCAL_PLAYER, LEVEL_NUM_ACTIVE,
 	LEVEL_ACTIVE_CHARS, LEVEL_CHARS, LEVEL_PLAYERS, LEVEL_IN_EDITOR, LEVEL_ZOOM,
-	LEVEL_FOCUS, LEVEL_GUI, LEVEL_ID, LEVEL_DIMENSIONS,
+	LEVEL_FOCUS, LEVEL_GUI, LEVEL_ID, LEVEL_DIMENSIONS, LEVEL_MUSIC_VOLUME,
 };
 }
 
@@ -3055,8 +3101,12 @@ variant level::get_value_by_slot(int slot) const
 		return variant(&v);
 	}
 	case LEVEL_GUI: {
-		if(gui_algorithm_) {
-			return variant(gui_algorithm_->get_object());
+		if(!gui_algorithm_.empty()) {
+			std::vector<variant> v;
+			foreach(gui_algorithm_ptr g, gui_algorithm_) {
+				v.push_back(variant(g->get_object()));
+			}
+			return variant(&v);
 		} else {
 			return variant();
 		}
@@ -3071,6 +3121,9 @@ variant level::get_value_by_slot(int slot) const
 		v.push_back(variant(boundaries_.x2()));
 		v.push_back(variant(boundaries_.y2()));
 		return variant(&v);
+	}
+	case LEVEL_MUSIC_VOLUME: {
+		return variant(sound::get_engine_music_volume());
 	}
 	}
 
@@ -3116,8 +3169,12 @@ variant level::get_value(const std::string& key) const
 
 		return variant(&v);
 	} else if(key == "gui") {
-		if(gui_algorithm_) {
-			return variant(gui_algorithm_->get_object());
+		if(!gui_algorithm_.empty()) {
+			std::vector<variant> v;
+			foreach(gui_algorithm_ptr g, gui_algorithm_) {
+				v.push_back(variant(g->get_object()));
+			}
+			return variant(&v);
 		} else {
 			return variant();
 		}
@@ -3139,6 +3196,8 @@ variant level::get_value(const std::string& key) const
 		v.push_back(variant(boundaries_.x2()));
 		v.push_back(variant(boundaries_.y2()));
 		return variant(&v);
+	} else if(key == "music_volume") {
+		return variant(sound::get_engine_music_volume());
 	} else if(key == "segment_width") {
 		return variant(segment_width_);
 	} else if(key == "segment_height") {
@@ -3153,18 +3212,15 @@ variant level::get_value(const std::string& key) const
 		pos.push_back(variant(graphics::screen_width()));
 		pos.push_back(variant(graphics::screen_height()));
 		return variant(&pos);
+	} else if(key == "debug_properties") {
+		return vector_to_variant(debug_properties_);
 	} else {
 		const_entity_ptr e = get_entity_by_label(key);
 		if(e) {
 			return variant(e.get());
 		}
 
-		std::map<std::string, variant>::const_iterator i = vars_.find(key);
-		if(i != vars_.end()) {
-			return i->second;
-		}
-
-		return variant();
+		return vars_[key];
 	}
 }
 
@@ -3177,7 +3233,7 @@ void level::set_value(const std::string& key, const variant& value)
 			lock_screen_.reset();
 		}
 	} else if(key == "zoom") {
-		zoom_level_ = value.as_int();
+		zoom_level_ = value.as_decimal();
 	} else if(key == "focus") {
 		focus_override_.clear();
 		for(int n = 0; n != value.num_elements(); ++n) {
@@ -3203,12 +3259,23 @@ void level::set_value(const std::string& key, const variant& value)
 	} else if(key == "dimensions") {
 		ASSERT_EQ(value.num_elements(), 4);
 		boundaries_ = rect(value[0].as_int(), value[1].as_int(), value[2].as_int() - value[0].as_int(), value[3].as_int() - value[1].as_int());
+	} else if(key == "music_volume") {
+		sound::set_engine_music_volume(value.as_decimal().as_float());
 	} else if(key == "camera_position") {
 		ASSERT_EQ(value.num_elements(), 2);
 		last_draw_position().x = value[0].as_int();
 		last_draw_position().y = value[1].as_int();
+	} else if(key == "debug_properties") {
+		if(value.is_null()) {
+			debug_properties_.clear();
+		} else if(value.is_string()) {
+			debug_properties_.clear();
+			debug_properties_.push_back(value.as_string());
+		} else {
+			debug_properties_ = value.as_list_string();
+		}
 	} else {
-		vars_[key] = value;
+		vars_ = vars_.add_attr(variant(key), value);
 	}
 }
 
@@ -3344,7 +3411,7 @@ bool level::can_interact(const rect& body) const
 
 void level::replay_from_cycle(int ncycle)
 {
-	return;
+		/*
 	const int cycles_ago = cycle_ - ncycle;
 	if(cycles_ago <= 0) {
 		return;
@@ -3361,22 +3428,24 @@ void level::replay_from_cycle(int ncycle)
 		backup();
 		do_processing();
 	}
+	*/
 }
 
 void level::backup()
 {
-	return;
+	if(backups_.empty() == false && backups_.back()->cycle == cycle_) {
+		return;
+	}
 
 	std::map<entity_ptr, entity_ptr> entity_map;
 
-	std::cerr << "BACKUP " << cycle_ << ": ";
 	backup_snapshot_ptr snapshot(new backup_snapshot);
 	snapshot->rng_seed = rng::get_seed();
 	snapshot->cycle = cycle_;
 	snapshot->chars.reserve(chars_.size());
 
+
 	foreach(const entity_ptr& e, chars_) {
-		std::cerr << e->debug_description() << "(" << (e->is_human() ? "HUMAN," : "") << e->centi_x() << "," << e->centi_y() << "):";
 		snapshot->chars.push_back(e->backup());
 		entity_map[e] = snapshot->chars.back();
 
@@ -3388,18 +3457,64 @@ void level::backup()
 		}
 	}
 
+	foreach(entity_group& g, groups_) {
+		snapshot->groups.push_back(entity_group());
+
+		foreach(entity_ptr e, g) {
+			std::map<entity_ptr, entity_ptr>::iterator i = entity_map.find(e);
+			if(i != entity_map.end()) {
+				snapshot->groups.back().push_back(i->second);
+			}
+		}
+	}
+
 	foreach(const entity_ptr& e, snapshot->chars) {
 		e->map_entities(entity_map);
 	}
 
-	std::cerr << "\n";
-
 	snapshot->last_touched_player = last_touched_player_;
 
 	backups_.push_back(snapshot);
-	if(backups_.size() > 300) {
-		backups_.erase(backups_.begin(), backups_.begin() + 100);
+	if(backups_.size() > 250) {
+		backups_.erase(backups_.begin(), backups_.begin() + 20);
 	}
+}
+
+int level::earliest_backup_cycle() const
+{
+	if(backups_.empty()) {
+		return cycle_;
+	} else {
+		return backups_.front()->cycle;
+	}
+}
+
+void level::reverse_one_cycle()
+{
+	if(backups_.empty()) {
+		return;
+	}
+
+	restore_from_backup(*backups_.back());
+	backups_.pop_back();
+}
+
+void level::reverse_to_cycle(int ncycle)
+{
+	if(backups_.empty()) {
+		return;
+	}
+
+	std::cerr << "REVERSING FROM " << cycle_ << " TO " << ncycle << "...\n";
+
+	while(backups_.size() > 1 && backups_.back()->cycle > ncycle) {
+		std::cerr << "REVERSING PAST " << backups_.back()->cycle << "...\n";
+		backups_.pop_back();
+	}
+
+	std::cerr << "GOT TO CYCLE: " << backups_.back()->cycle << "\n";
+
+	reverse_one_cycle();
 }
 
 void level::restore_from_backup(backup_snapshot& snapshot)
@@ -3409,7 +3524,9 @@ void level::restore_from_backup(backup_snapshot& snapshot)
 	chars_ = snapshot.chars;
 	players_ = snapshot.players;
 	player_ = snapshot.player;
+	groups_ = snapshot.groups;
 	last_touched_player_ = snapshot.last_touched_player;
+	active_chars_.clear();
 
 	solid_chars_.clear();
 
@@ -3419,6 +3536,82 @@ void level::restore_from_backup(backup_snapshot& snapshot)
 			chars_by_label_[e->label()] = e;
 		}
 	}
+}
+
+std::vector<entity_ptr> level::trace_past(entity_ptr e, int ncycle)
+{
+	backup();
+	int prev_cycle = -1;
+	std::vector<entity_ptr> result;
+	std::deque<backup_snapshot_ptr>::reverse_iterator i = backups_.rbegin();
+	while(i != backups_.rend() && (*i)->cycle >= ncycle) {
+		const backup_snapshot& snapshot = **i;
+		if(prev_cycle != -1 && snapshot.cycle == prev_cycle) {
+			++i;
+			continue;
+		}
+
+		prev_cycle = snapshot.cycle;
+
+		foreach(const entity_ptr& ghost, snapshot.chars) {
+			if(ghost->label() == e->label()) {
+				result.push_back(ghost);
+				break;
+			}
+		}
+		++i;
+	}
+
+	return result;
+}
+
+std::vector<entity_ptr> level::predict_future(entity_ptr e, int ncycles)
+{
+	disable_flashes_scope flashes_disabled_scope;
+	const controls::control_backup_scope ctrl_backup_scope;
+
+	backup();
+	backup_snapshot_ptr snapshot = backups_.back();
+	backups_.pop_back();
+
+	const size_t starting_backups = backups_.size();
+
+	int begin_time = SDL_GetTicks();
+	int nframes = 0;
+
+	const int controls_end = controls::local_controls_end();
+	std::cerr << "PREDICT FUTURE: " << cycle_ << "/" << controls_end << "\n";
+	while(cycle_ < controls_end) {
+		try {
+			const assert_recover_scope safe_scope;
+			process();
+			backup();
+			++nframes;
+		} catch(validation_failure_exception& e) {
+			std::cerr << "ERROR WHILE PREDICTING FUTURE...\n";
+			break;
+		}
+	}
+
+	std::cerr << "TOOK " << (SDL_GetTicks() - begin_time) << "ms TO MOVE FORWARD " << nframes << " frames\n";
+
+	begin_time = SDL_GetTicks();
+
+	std::vector<entity_ptr> result = trace_past(e, -1);
+
+	std::cerr << "TOOK " << (SDL_GetTicks() - begin_time) << "ms to TRACE PAST OF " << result.size() << " FRAMES\n";
+
+	backups_.resize(starting_backups);
+	restore_from_backup(*snapshot);
+
+	return result;
+}
+
+void level::transfer_state_to(level& lvl)
+{
+	backup();
+	lvl.restore_from_backup(*backups_.back());
+	backups_.pop_back();
 }
 
 void level::get_tile_layers(std::set<int>* all_layers, std::set<int>* hidden_layers)
@@ -3453,6 +3646,11 @@ void level::editor_freeze_tile_updates(bool value)
 			rebuild_tiles();
 		}
 	}
+}
+
+decimal level::zoom_level() const
+{
+	return zoom_level_;
 }
 
 void level::add_speech_dialog(boost::shared_ptr<speech_dialog> d)
@@ -3613,6 +3811,7 @@ bool level::relocate_object(entity_ptr e, int new_x, int new_y)
 	}
 
 
+#ifndef NO_EDITOR
 	//update any x/y co-ordinates to be the same relative to the object's
 	//new position.
 	if(e->editor_info()) {
@@ -3633,11 +3832,27 @@ bool level::relocate_object(entity_ptr e, int new_x, int new_y)
 					e->handle_event("editor_changed_variable");
 				}
 				break;
+			case editor_variable_info::TYPE_POINTS:
+				if(value.is_list()) {
+					std::vector<variant> new_value;
+					foreach(variant point, value.as_list()) {
+						std::vector<variant> p = point.as_list();
+						if(p.size() == 2) {
+							p[0] = variant(p[0].as_int() + delta_x);
+							p[1] = variant(p[1].as_int() + delta_y);
+							new_value.push_back(variant(&p));
+						}
+					}
+					e->handle_event("editor_changing_variable");
+					e->mutate_value(var.variable_name(), variant(&new_value));
+					e->handle_event("editor_changed_variable");
+				}
 			default:
 				break;
 			}
 		}
 	}
+#endif // !NO_EDITOR
 
 	return true;
 }
@@ -3663,6 +3878,31 @@ int level::current_difficulty() const
 	return p->difficulty();
 }
 
+bool level::gui_event(const SDL_Event &event)
+{
+	foreach(gui_algorithm_ptr g, gui_algorithm_) {
+		if(g->gui_event(*this, event)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+std::pair<std::vector<level_tile>::const_iterator, std::vector<level_tile>::const_iterator> level::tiles_at_loc(int x, int y) const
+{
+	x = round_tile_size(x);
+	y = round_tile_size(y);
+
+	if(tiles_by_position_.size() != tiles_.size()) {
+		tiles_by_position_ = tiles_;
+		std::sort(tiles_by_position_.begin(), tiles_by_position_.end(), level_tile_pos_comparer());
+	}
+
+	std::pair<int, int> loc(x, y);
+	return std::equal_range(tiles_by_position_.begin(), tiles_by_position_.end(), loc, level_tile_pos_comparer());
+}
+
+
 UTILITY(correct_solidity)
 {
 	std::vector<std::string> files;
@@ -3678,7 +3918,7 @@ UTILITY(correct_solidity)
 
 		foreach(entity_ptr c, lvl->get_chars()) {
 			if(entity_collides_with_level(*lvl, *c, MOVE_NONE)) {
-				if(place_entity_in_level(*lvl, *c)) {
+				if(place_entity_in_level_with_large_displacement(*lvl, *c)) {
 					std::cerr << "LEVEL: " << lvl->id() << " CORRECTED " << c->debug_description() << "\n";
 				} else {
 					std::cerr << "LEVEL: " << lvl->id() << " FAILED TO CORRECT " << c->debug_description() << "\n";
@@ -3689,9 +3929,7 @@ UTILITY(correct_solidity)
 			c->handle_event("editor_added");
 		}
 
-		std::string data;
-		wml::write(lvl->write(), data);
-		sys::write_file(preferences::level_path() + file, data);
+		sys::write_file(preferences::level_path() + file, lvl->write().write_json(true));
 	}
 }
 
@@ -3704,27 +3942,23 @@ UTILITY(compile_levels)
 	std::vector<std::string> files;
 	sys::get_files_in_dir(preferences::level_path(), &files);
 
-	wml::node_ptr index_node(new wml::node("level_index"));
+	variant_builder index_node;
 
 	foreach(const std::string& file, files) {
 		std::cerr << "LOADING LEVEL '" << file << "'\n";
 		boost::intrusive_ptr<level> lvl(new level(file));
 		lvl->finish_loading();
 		lvl->record_zorders();
-		std::string data;
-		wml::write(lvl->write(), data);
-		sys::write_file("data/compiled/level/" + file, data);
+		sys::write_file("data/compiled/level/" + file, lvl->write().write_json(true));
 
-		wml::node_ptr node(new wml::node("level"));
-		node->set_attr("level", lvl->id());
-		node->set_attr("title", lvl->title());
-		node->set_attr("music", lvl->music());
-		index_node->add_child(node);
+		variant_builder level_summary;
+		level_summary.add("level", lvl->id());
+		level_summary.add("title", lvl->title());
+		level_summary.add("music", lvl->music());
+		index_node.add("level", level_summary.build());
 	}
 
-	std::string index_data;
-	wml::write(index_node, index_data);
-	sys::write_file("data/compiled/level_index.cfg", index_data);
+	sys::write_file("data/compiled/level_index.cfg", index_node.build().write_json(true));
 
 	level_object::write_compiled();
 }
@@ -3748,15 +3982,13 @@ BENCHMARK(load_nene)
 BENCHMARK(load_all_levels)
 {
 	std::vector<std::string> files;
-	sys::get_files_in_dir(preferences::level_path(), &files);
+	module::get_files_in_dir(preferences::level_path(), &files);
 	BENCHMARK_LOOP {
 		foreach(const std::string& file, files) {
 			boost::intrusive_ptr<level> lvl(new level(file));
 		}
 	}
 }
-
-#include "wml_writer.hpp"
 
 BENCHMARK(load_and_save_all_levels)
 {
@@ -3768,9 +4000,7 @@ BENCHMARK(load_and_save_all_levels)
 			boost::intrusive_ptr<level> lvl(new level(file));
 			lvl->finish_loading();
 
-			std::string data;
-			wml::write(lvl->write(), data);
-			sys::write_file(preferences::level_path() + file, data);
+			sys::write_file(preferences::level_path() + file, lvl->write().write_json(true));
 		}
 	}
 }

@@ -6,8 +6,7 @@
 #include "level.hpp"
 #include "playable_custom_object.hpp"
 #include "string_utils.hpp"
-#include "wml_node.hpp"
-#include "wml_utils.hpp"
+#include "variant_utils.hpp"
 
 playable_custom_object::playable_custom_object(const custom_object& obj)
   : custom_object(obj), player_info_(*this), difficulty_(0), vertical_look_(0),
@@ -25,28 +24,29 @@ playable_custom_object::playable_custom_object(const playable_custom_object& obj
 	player_info_.set_entity(*this);
 }
 
-playable_custom_object::playable_custom_object(wml::const_node_ptr node)
+playable_custom_object::playable_custom_object(variant node)
   : custom_object(node), player_info_(*this, node),
-    difficulty_(wml::get_int(node, "difficulty", 0)),
+    difficulty_(node["difficulty"].as_int(0)),
     vertical_look_(0), underwater_ctrl_x_(0), underwater_ctrl_y_(0),
-	underwater_controls_(wml::get_bool(node, "underwater_controls", false)),
+	underwater_controls_(node["underwater_controls"].as_bool(false)),
 	can_interact_(0)
 {
 }
 
-wml::node_ptr playable_custom_object::write() const
+variant playable_custom_object::write() const
 {
-	wml::node_ptr node = custom_object::write();
-	node->set_attr("is_human", "true");
+	variant_builder node;
+	node.merge_object(custom_object::write());
+	node.merge_object(player_info_.write());
+	node.add("is_human", true);
 	if(difficulty_) {
-		node->set_attr("difficulty", formatter() << difficulty_);
+		node.add("difficulty", difficulty_);
 	}
 
 	if(underwater_controls_) {
-		node->set_attr("underwater_controls", "true");
+		node.add("underwater_controls", true);
 	}
-	player_info_.write(node);
-	return node;
+	return node.build();
 }
 
 void playable_custom_object::save_game()
@@ -148,10 +148,15 @@ variant playable_custom_object::get_value(const std::string& key) const
 		std::vector<variant> result;
 		#if TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
 		#else
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+		Uint8* key_state = SDL_GetKeyboardState(NULL);
+		for(int count = 0; count < SDL_NUM_SCANCODES; count++) {
+#else
 		Uint8* key_state = SDL_GetKeyState(NULL);
-		for (int count = SDLK_FIRST; count < SDLK_LAST; count++) {
+		for(int count = SDLK_FIRST; count < SDLK_LAST; count++) {
+#endif
 			if(key_state[count]) {				//Returns only keys that are down so the list that ffl has to deal with is small.
-				if(util::isprint(count)) {
+				if(util::c_isprint(count)) {
 					std::string str(1,count);
 					result.push_back(variant(str));
 				} else {
@@ -270,8 +275,6 @@ void playable_custom_object::set_value(const std::string& key, const variant& va
 				ASSERT_LOG(control_key != -1, "ILLEGAL STRING SET FOR control_lock: '" << str << "' LEGAL KEYS ARE ctrl_(up|down|left|right|attack|jump)");
 				state |= 1 << control_key;
 			}
-
-			std::cerr << "SET CONTROL STATE: " << (int)state << "\n";
 
 			//destroy the old one before creating a new control_lock,
 			//since control_lock objects must be constructed and destroyed

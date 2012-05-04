@@ -55,6 +55,11 @@ public:
     bool process_event(const SDL_Event& e, bool claimed);
 	
 	void set_on_quit(boost::function<void ()> onquit) { on_quit_ = onquit; }
+
+	void set_background_frame(const std::string& id) { background_framed_gui_element_ = id; }
+	void set_draw_background_fn(boost::function<void()> fn) { draw_background_fn_ = fn; }
+
+	virtual bool has_focus() const;
 protected:
 	virtual bool handle_event(const SDL_Event& event, bool claimed);
 	virtual bool handle_event_children(const SDL_Event& event, bool claimed);
@@ -83,6 +88,9 @@ private:
 	mutable GLfloat bg_alpha_;
 
 	int last_draw_;
+
+	std::string background_framed_gui_element_;
+	boost::function<void()> draw_background_fn_;
 };
 
 typedef boost::shared_ptr<dialog> dialog_ptr;

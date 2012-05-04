@@ -1,12 +1,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
-#include <GLES/gl.h>
-#else
-#include <GL/gl.h>
-#endif
-
+#include "graphics.hpp"
 #include "color_utils.hpp"
 #include "string_utils.hpp"
 #include "unit_test.hpp"
@@ -67,6 +62,27 @@ color::color( const std::string& str)
 	}
 }
 
+color::color(const variant& v)
+{
+	std::vector<int> vec = v.as_list_int();
+	const int r = vec.size() > 0 ? vec[0] : 0;
+	const int g = vec.size() > 1 ? vec[1] : 0;
+	const int b = vec.size() > 2 ? vec[2] : 0;
+	const int a = vec.size() > 3 ? vec[3] : 255;
+	*this = color(r,g,b,a);
+}
+
+variant color::write() const
+{
+	std::vector<variant> v;
+	v.reserve(4);
+	v.push_back(variant(static_cast<int>(r())));
+	v.push_back(variant(static_cast<int>(g())));
+	v.push_back(variant(static_cast<int>(b())));
+	v.push_back(variant(static_cast<int>(a())));
+	return variant(&v);
+}
+
 
 variant color::get_value(const std::string& key) const
 {
@@ -96,6 +112,12 @@ void color::add_to_vector(std::vector<GLfloat>* v) const
 	v->push_back(a()/255.0);
 }
 
+SDL_Color color::as_sdl_color() const
+{
+	SDL_Color result = {r(), g(), b(), a()};
+	return result;
+}
+
 color_transform::color_transform(const color& c)
 {
 	rgba_[0] = c.r();
@@ -121,6 +143,27 @@ color_transform::color_transform(const std::string& str)
 			rgba_[n] = atoi(components[n].c_str());
 		}
 	}
+}
+
+color_transform::color_transform(const variant& v)
+{
+	for(int n = 0; n != 4; ++n) {
+		if(n < v.num_elements()) {
+			rgba_[n] = v[n].as_int();
+		} else {
+			rgba_[n] = 255;
+		}
+	}
+}
+
+variant color_transform::write() const
+{
+	std::vector<variant> res;
+	for(int n = 0; n != 4; ++n) {
+		res.push_back(variant(static_cast<int>(rgba_[n])));
+	}
+
+	return variant(&res);
 }
 
 std::string color_transform::to_string() const

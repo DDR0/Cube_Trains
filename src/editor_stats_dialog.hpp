@@ -1,5 +1,7 @@
 #ifndef EDITOR_STATS_DIALOG_HPP_INCLUDED
 #define EDITOR_STATS_DIALOG_HPP_INCLUDED
+#ifndef NO_EDITOR
+
 
 #include <string>
 #include <vector>
@@ -17,10 +19,10 @@ public:
 	explicit editor_stats_dialog(editor& e);
 	void init();
 private:
-	void add_stats(const std::vector<stats::record_ptr>& stats);
 	editor& editor_;
 };
 
 }
 
+#endif // !NO_EDITOR
 #endif

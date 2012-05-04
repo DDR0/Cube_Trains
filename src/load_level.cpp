@@ -4,18 +4,20 @@
 #include "concurrent_cache.hpp"
 #include "filesystem.hpp"
 #include "foreach.hpp"
+#include "json_parser.hpp"
 #include "level.hpp"
 #include "load_level.hpp"
+#include "module.hpp"
 #include "package.hpp"
 #include "preferences.hpp"
 #include "preprocessor.hpp"
 #include "string_utils.hpp"
 #include "texture.hpp"
 #include "thread.hpp"
-#include "wml_parser.hpp"
+#include "variant.hpp"
 
 namespace {
-typedef concurrent_cache<std::string, wml::const_node_ptr> level_wml_map;
+typedef concurrent_cache<std::string, variant> level_wml_map;
 level_wml_map& wml_cache() {
 	static level_wml_map instance;
 	return instance;
@@ -47,10 +49,10 @@ public:
 		}
 
 		try {
-			wml::const_node_ptr node(wml::parse_wml(preprocess(sys::read_file(filename))));
+			variant node(json::parse_from_file(filename));
 			wml_cache().put(lvl_, node);
-		} catch(wml::parse_error& e) {
-			ASSERT_LOG(false, "ERROR PARSING LEVEL WML: " << e.message);
+		} catch(json::parse_error& e) {
+			ASSERT_LOG(false, "ERROR PARSING LEVEL WML FOR '" << filename << "': " << e.error_message());
 		}catch(...) {
 			std::cerr << "FAILED TO LOAD " << filename << "\n";
 			ASSERT_LOG(false, "FAILED TO LOAD");
@@ -82,12 +84,21 @@ void preload_level_wml(const std::string& lvl)
 		return;
 	}
 
-	wml_cache().put(lvl, wml::const_node_ptr());
+	wml_cache().put(lvl, variant());
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+	wml_threads()[lvl] = new threading::thread("load-"+lvl, wml_loader(lvl));
+#else
 	wml_threads()[lvl] = new threading::thread(wml_loader(lvl));
+#endif
 }
 
-wml::const_node_ptr load_level_wml(const std::string& lvl)
+variant load_level_wml(const std::string& lvl)
 {
+	if(lvl == "tmp_state.cfg") {
+		//special state for debugging.
+		return json::parse_from_file("./tmp_state.cfg");
+	}
+
 	if(is_save_file(lvl) || lvl == "autosave.cfg") {
 		std::string filename;
 		if(is_save_file(lvl)) {
@@ -96,7 +107,7 @@ wml::const_node_ptr load_level_wml(const std::string& lvl)
 			filename = preferences::auto_save_file_path();
 		}
 
-		return wml::parse_wml(preprocess(sys::read_file(filename)));
+		return json::parse_from_file(filename);
 	}
 
 	if(wml_cache().count(lvl)) {
@@ -114,7 +125,7 @@ wml::const_node_ptr load_level_wml(const std::string& lvl)
 	return load_level_wml_nowait(lvl);
 }
 
-wml::const_node_ptr load_level_wml_nowait(const std::string& lvl)
+variant load_level_wml_nowait(const std::string& lvl)
 {
 	return wml_cache().get(lvl);
 }
@@ -170,7 +181,11 @@ void preload_level(const std::string& lvl)
 	assert(!lvl.empty());
 	threading::lock lck(levels_loading_mutex());
 	if(levels_loading.count(lvl) == 0) {
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+		levels_loading[lvl].first = new threading::thread("load"+lvl,level_loader(lvl));
+#else
 		levels_loading[lvl].first = new threading::thread(level_loader(lvl));
+#endif
 	}
 }
 
@@ -210,7 +225,7 @@ bool hidden_file(const std::string& filename) {
 std::vector<std::string> get_known_levels()
 {
 	std::vector<std::string> files;
-	sys::get_files_in_dir(preferences::level_path(), &files);
+	module::get_files_in_dir(preferences::level_path(), &files);
 	files.erase(std::remove_if(files.begin(), files.end(), hidden_file), files.end());
 
 	foreach(const std::string& pkg, package::all_packages()) {

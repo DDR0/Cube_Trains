@@ -1,13 +1,14 @@
 #include <boost/bind.hpp>
 #include <iostream>
 #include <map>
+#include <set>
 
 #include "asserts.hpp"
 #include "foreach.hpp"
 #include "preferences.hpp"
 #include "unit_test.hpp"
 
-#include "SDL.h"
+#include "graphics.hpp"
 
 namespace test {
 
@@ -40,6 +41,11 @@ UtilityMap& get_utility_map()
 	return map;
 }
 
+std::set<std::string>& get_command_line_utilities() {
+	static std::set<std::string> map;
+	return map;
+}
+
 }
 
 int register_test(const std::string& name, UnitTest test)
@@ -48,14 +54,23 @@ int register_test(const std::string& name, UnitTest test)
 	return 0;
 }
 
-int register_utility(const std::string& name, UtilityProgram utility)
+int register_utility(const std::string& name, UtilityProgram utility, bool needs_video)
 {
 	get_utility_map()[name] = utility;
+	if(!needs_video) {
+		get_command_line_utilities().insert(name);
+	}
 	return 0;
+}
+
+bool utility_needs_video(const std::string& name)
+{
+	return get_command_line_utilities().count(name) == 0;
 }
 
 bool run_tests(const std::vector<std::string>* tests)
 {
+	const int start_time = SDL_GetTicks();
 	std::vector<std::string> all_tests;
 	if(!tests) {
 		for(TestMap::const_iterator i = get_test_map().begin(); i != get_test_map().end(); ++i) {
@@ -78,6 +93,9 @@ bool run_tests(const std::vector<std::string>* tests)
 		} catch(failure_exception&) {
 			std::cerr << "TEST " << test << " FAILED!!\n";
 			++nfail;
+//		} catch(...) {
+//			std::cerr << "TEST " << test << " FAILED WITH UNKNOWN EXCEPTION!!\n";
+//			++nfail;
 		}
 	}
 
@@ -85,7 +103,7 @@ bool run_tests(const std::vector<std::string>* tests)
 		std::cerr << npass << " TESTS PASSED, " << nfail << " TESTS FAILED\n";
 		return false;
 	} else {
-		std::cerr << "ALL " << npass << " TESTS PASSED\n";
+		std::cerr << "ALL " << npass << " TESTS PASSED IN " << (SDL_GetTicks() - start_time) << "ms\n";
 		return true;
 	}
 }
@@ -109,7 +127,7 @@ void run_benchmark(const std::string& name, BenchmarkTest fn)
 	fn(1);
 
 	std::cerr << "RUNNING BENCHMARK " << name << "...\n";
-	const int MinTicks = 5000;
+	const int MinTicks = 1000;
 	for(int64_t nruns = 10; ; nruns *= 10) {
 		const int start_time = SDL_GetTicks();
 		fn(nruns);

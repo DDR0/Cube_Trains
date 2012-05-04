@@ -15,7 +15,7 @@
 
 #include <vector>
 
-#include "SDL.h"
+#include "graphics.hpp"
 
 #include "color_utils.hpp"
 #include "geometry.hpp"
@@ -30,8 +30,8 @@ namespace graphics
 {
 
 SDL_Surface* set_video_mode(int w, int h, int bitsperpixel, int flags);
-
 bool set_video_mode(int w, int h);
+void reset_opengl_state();
 
 std::vector<GLfloat>& global_vertex_array();
 std::vector<GLfloat>& global_texcoords_array();
@@ -135,10 +135,22 @@ void zoom_in();
 void zoom_out();
 void zoom_default();
 
+#ifndef SDL_VIDEO_OPENGL_ES
 void coords_to_screen(GLfloat sx, GLfloat sy, GLfloat sz,
 		      GLfloat* dx, GLfloat* dy, GLfloat* dz);
 void push_clip(const SDL_Rect& rect);
 void pop_clip();
+
+struct clip_scope {
+	clip_scope(const SDL_Rect& rect) {
+		push_clip(rect);
+	}
+
+	~clip_scope() {
+		pop_clip();
+	}
+};
+#endif // SDL_VIDEO_OPENGL_ES
 
 const SDL_Color& color_black();
 const SDL_Color& color_white();

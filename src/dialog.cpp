@@ -10,7 +10,7 @@
 
    See the COPYING file for more details.
 */
-#include "SDL.h"
+#include "graphics.hpp"
 
 #include <iostream>
 
@@ -24,6 +24,7 @@
 #include "draw_scene.hpp"
 #include "level.hpp"
 #include "framed_gui_element.hpp"
+#include "preferences.hpp"
 
 namespace gui {
 
@@ -125,6 +126,9 @@ void dialog::prepare_draw()
 void dialog::complete_draw()
 {
 	SDL_GL_SwapBuffers();
+#if defined(__ANDROID__)
+	graphics::reset_opengl_state();
+#endif
 
 	const int end_draw = last_draw_ + 20;
 	const int delay_time = std::max<int>(1, end_draw - SDL_GetTicks());
@@ -160,15 +164,19 @@ void dialog::handle_draw() const
 			glColor4f(1.0, 1.0, 1.0, 1.0);
 		}
 	}
-	if (!level::current().in_editor())
-	{
-		draw_scene(level::current(), last_draw_position());
+
+	if(draw_background_fn_) {
+		draw_background_fn_();
+	}
+
+	if(background_framed_gui_element_.empty() == false) {
 		SDL_Rect rect = {x(),y(),width(),height()};
 		SDL_Color col = {0,0,0,0};
 		graphics::draw_rect(rect, col, 204);
-		const_framed_gui_element_ptr window(framed_gui_element::get("empty_window"));
+		const_framed_gui_element_ptr window(framed_gui_element::get(background_framed_gui_element_));
 		window->blit(x(),y(),width(),height(), 1);
 	}
+
 	handle_draw_children();
 }
 
@@ -186,6 +194,9 @@ bool dialog::handle_event_children(const SDL_Event &event, bool claimed) {
 
 bool dialog::handle_event(const SDL_Event& event, bool claimed)
 {
+
+    claimed |= handle_event_children(event, claimed);
+
     if(!claimed && opened_) {
         if(event.type == SDL_KEYDOWN &&
            event.key.keysym.sym == SDLK_RETURN) {
@@ -198,7 +209,6 @@ bool dialog::handle_event(const SDL_Event& event, bool claimed)
 			claimed = true;
 		}
     }
-    claimed |= handle_event_children(event, claimed);
 
 	if(!claimed) {
 		switch(event.type) {
@@ -217,6 +227,17 @@ bool dialog::handle_event(const SDL_Event& event, bool claimed)
 		}
 	}
 	return claimed;
+}
+
+bool dialog::has_focus() const
+{
+	foreach(widget_ptr w, widgets_) {
+		if(w->has_focus()) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 

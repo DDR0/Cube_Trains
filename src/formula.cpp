@@ -23,6 +23,7 @@
 //#include "foreach.hpp"
 #include "asserts.hpp"
 #include "foreach.hpp"
+#include "formatter.hpp"
 #include "formula.hpp"
 #include "formula_callable.hpp"
 #include "formula_callable_definition.hpp"
@@ -31,10 +32,11 @@
 #include "formula_tokenizer.hpp"
 #include "i18n.hpp"
 #include "map_utils.hpp"
+#include "preferences.hpp"
 #include "random.hpp"
 #include "string_utils.hpp"
 #include "unit_test.hpp"
-#include "wml_node.hpp"
+#include "variant_utils.hpp"
 
 namespace {
 	//the last formula that was executed; used for outputting debugging info.
@@ -55,10 +57,6 @@ namespace game_logic
 		_verbatim_string_expressions = verbatim;
 	}
 	
-	formula_error::formula_error()
-	{
-	}
-	
 	void formula_callable::set_value(const std::string& key, const variant& /*value*/)
 	{
 		std::cerr << "ERROR: cannot set key '" << key << "' on object\n";
@@ -74,27 +72,23 @@ namespace game_logic
 		ASSERT_LOG(false, "Could not get value by slot from formula callable " << slot);
 		return variant(0); //so VC++ doesn't complain
 	}
-	
-	map_formula_callable::map_formula_callable(wml::const_node_ptr node)
-	: formula_callable(false), fallback_(NULL)
+
+	void formula_callable::serialize_to_string(std::string& str) const
 	{
-		if(!node) {
+		if(preferences::serialize_bad_objects()) {
+			//force serialization of this through so we can work out what's going on.
+			str += "(UNSERIALIZABLE_OBJECT)";
 			return;
 		}
-		
-		for(wml::node::const_attr_iterator i = node->begin_attr(); i != node->end_attr(); ++i) {
-			variant var;
-			var.serialize_from_string(i->second);
-			add(i->first, var);
-		}
+
+		throw type_error("Tried to serialize type which cannot be serialized");
 	}
-	
-	void map_formula_callable::write(wml::node_ptr node) const
+
+	map_formula_callable::map_formula_callable(variant node)
+	  : formula_callable(false), fallback_(NULL)
 	{
-		for(std::map<std::string,variant>::const_iterator i = values_.begin(); i != values_.end(); ++i) {
-			std::string val;
-			i->second.serialize_to_string(val);
-			node->set_attr(i->first, val);
+		foreach(const variant_pair& value, node.as_map()) {
+			values_[value.first.as_string()] = value.second;
 		}
 	}
 	
@@ -130,6 +124,16 @@ namespace game_logic
 		} else {
 			return itor->second;
 		}
+	}
+
+	variant map_formula_callable::write() const
+	{
+		variant_builder result;
+		for(std::map<std::string, variant>::const_iterator i = values_.begin();
+		    i != values_.end(); ++i) {
+			result.add(i->first, i->second);
+		}
+		return result.build();
 	}
 	
 	void map_formula_callable::get_inputs(std::vector<formula_input>* inputs) const
@@ -181,14 +185,13 @@ private:
 	//reference to the list, so that we can allow static evaluation
 	//not to be fooled.
 	variant static_evaluate(const formula_callable& variables) const {
-		variant result;
-		std::vector<variant>& res = result.initialize_list();
+		std::vector<variant> res;
 		res.reserve(items_.size());
 		for(std::vector<expression_ptr>::const_iterator i = items_.begin(); i != items_.end(); ++i) {
 			res.push_back((*i)->evaluate(variables));
 		}
 
-		return result;
+		return variant(&res);
 	}
 
 	variant execute(const formula_callable& variables) const {
@@ -196,6 +199,83 @@ private:
 	}
 	
 	std::vector<expression_ptr> items_;
+};
+
+class list_comprehension_expression : public formula_expression {
+public:
+	list_comprehension_expression(expression_ptr expr, const std::map<std::string, expression_ptr>& generators, const std::vector<expression_ptr>& filters)
+	  : formula_expression("_list_compr"), expr_(expr), generators_(generators), filters_(filters)
+	{
+		for(std::map<std::string,expression_ptr>::const_iterator i = generators.begin(); i != generators.end(); ++i) {
+			generator_names_.push_back(i->first);
+		}
+	}
+	
+private:
+	variant execute(const formula_callable& variables) const {
+		std::vector<int> nelements;
+		std::vector<variant> lists;
+		for(std::map<std::string, expression_ptr>::const_iterator i = generators_.begin(); i != generators_.end(); ++i) {
+			lists.push_back(i->second->evaluate(variables));
+			nelements.push_back(lists.back().num_elements());
+			if(nelements.back() == 0) {
+				std::vector<variant> items;
+				return variant(&items);
+			}
+		}
+
+		std::vector<variant> result;
+
+		boost::intrusive_ptr<map_formula_callable> callable(new map_formula_callable(&variables));
+		std::vector<variant*> args;
+		foreach(const std::string& arg, generator_names_) {
+			args.push_back(&callable->add_direct_access(arg));
+		}
+
+		std::vector<int> indexes(lists.size());
+		for(;;) {
+			for(int n = 0; n != indexes.size(); ++n) {
+				*args[n] = lists[n][indexes[n]];
+			}
+
+			bool passes = true;
+			foreach(const expression_ptr& filter, filters_) {
+				if(filter->evaluate(*callable).as_bool() == false) {
+					passes = false;
+					break;
+				}
+			}
+
+			if(passes) {
+				result.push_back(expr_->evaluate(*callable));
+			}
+
+			if(!increment_vec(indexes, nelements)) {
+				break;
+			}
+		}
+		
+		return variant(&result);
+	}
+
+	static bool increment_vec(std::vector<int>& v, const std::vector<int>& max_values) {
+		int index = 0;
+		while(index != v.size()) {
+			if(++v[index] < max_values[index]) {
+				return true;
+			}
+
+			v[index] = 0;
+			++index;
+		}
+
+		return false;
+	}
+
+	expression_ptr expr_;
+	std::map<std::string, expression_ptr> generators_;
+	std::vector<std::string> generator_names_;
+	std::vector<expression_ptr> filters_;
 };
 
 class map_expression : public formula_expression {
@@ -229,8 +309,7 @@ public:
 		} else if(op == "-") {
 			op_ = OP_SUB;
 		} else {
-			std::cerr << "illegal unary operator: '" << op << "'\n";
-			throw formula_error();
+			ASSERT_LOG(false, "illegal unary operator: '" << op << "'\n" << debug_pinpoint_location());
 		}
 	}
 private:
@@ -354,6 +433,8 @@ public:
 		return true;
 	}
 
+	void set_function(expression_ptr fn) { function_ = fn; }
+
 	expression_ptr optimize() const {
 		if(callable_def_) {
 			const int index = callable_def_->get_slot(id_);
@@ -383,24 +464,35 @@ private:
 	}
 	
 	variant execute(const formula_callable& variables) const {
-		return variables.query_value(id_);
+		variant result = variables.query_value(id_);
+		if(result.is_null() && function_) {
+			return function_->evaluate(variables);
+		}
+
+		return result;
 	}
 	std::string id_;
 	const formula_callable_definition* callable_def_;
+
+	//If this symbol is a function, this is the value we can return for it.
+	expression_ptr function_;
 };
 
 class lambda_function_expression : public formula_expression {
 public:
-	lambda_function_expression(const std::vector<std::string>& args, const_formula_ptr fml) : args_(args), fml_(fml)
+	lambda_function_expression(const std::vector<std::string>& args, const_formula_ptr fml, int base_slot, const std::vector<variant>& default_args) : args_(args), fml_(fml), base_slot_(base_slot), default_args_(default_args)
 	{}
 	
 private:
 	variant execute(const formula_callable& variables) const {
-		return variant(fml_, args_, variables);
+		variant v(fml_, args_, variables, base_slot_, default_args_);
+		return v;
 	}
 	
 	std::vector<std::string> args_;
 	game_logic::const_formula_ptr fml_;
+	int base_slot_;
+	std::vector<variant> default_args_;
 };
 
 class function_call_expression : public formula_expression {
@@ -418,6 +510,12 @@ private:
 		}
 
 		if(!left.is_function()) {
+			//TODO: Nasty hack to make null() still work -- deprecated in
+			//favor of null.
+			if(left_->str() == "null" && args_.empty()) {
+				return variant();
+			}
+
 			std::cerr << "ERROR: " << left_->str() << " IS NOT A VALID FUNCTION\n";
 		}
 		
@@ -473,17 +571,20 @@ class square_bracket_expression : public formula_expression { //TODO
 public:
 	square_bracket_expression(expression_ptr left, expression_ptr key)
 	: formula_expression("_sqbr"), left_(left), key_(key)
-	{}
+	{
+	}
 private:
 	variant execute(const formula_callable& variables) const {
 		const variant left = left_->evaluate(variables);
 		const variant key = key_->evaluate(variables);
 		if(left.is_list() || left.is_map()) {
 			return left[ key ];
+		} else if(left.is_callable()) {
+			return left.as_callable()->query_value(key.as_string());
 		} else {
+			std::cerr << "STACK TRACE FOR ERROR:\n" << get_call_stack() << "\n";
 			output_formula_error_info();
-			std::cerr << "illegal usage of operator []: called on " << left.to_debug_string() << " value: " << left_->str() << "'\n";
-			throw formula_error();
+			ASSERT_LOG(false, "illegal usage of operator []: called on " << left.to_debug_string() << " value: " << left_->str() << "'\n" << debug_pinpoint_location());
 		}
 	}
 	
@@ -506,20 +607,13 @@ private:
 				return variant();
 			}
 			if(end_index >= begin_index) {
-				std::vector<variant> result;
-				result.reserve(end_index - begin_index);
-				while(begin_index != end_index) {
-					result.push_back(left[begin_index++]);
-				}
-				
-				return variant(&result);
+				return left.get_list_slice(begin_index, end_index);
 			} else {
 				return variant();
 			}
 			
 		} else {
-			std::cerr << "illegal usage of operator [:]'\n";
-			throw formula_error();
+			ASSERT_LOG(false, "illegal usage of operator [:]'\n" << debug_pinpoint_location());
 		}
 	}
 	
@@ -726,56 +820,74 @@ private:
 typedef std::map<std::string,expression_ptr> expr_table;
 typedef boost::shared_ptr<expr_table> expr_table_ptr;
 
-class where_variables: public formula_callable {
-public:
-	where_variables(const formula_callable &base,
-					expr_table_ptr table )
-	: formula_callable(false), base_(base), table_(table) { }
-private:
-	const formula_callable& base_;
-	expr_table_ptr table_;
-	
-	mutable std::map<std::string, variant> results_cache_;
-	
-	void get_inputs(std::vector<formula_input>* inputs) const {
-		for(expr_table::const_iterator i = table_->begin(); i != table_->end(); ++i) {
-			inputs->push_back(formula_input(i->first, FORMULA_READ_ONLY));
-		}
+const_formula_callable_definition_ptr create_where_definition(expr_table_ptr table, const formula_callable_definition* def)
+{
+	std::vector<std::string> items;
+	for(std::map<std::string,expression_ptr>::const_iterator i = table->begin(); i != table->end(); ++i) {
+		items.push_back(i->first);
 	}
 
+	ASSERT_LOG(items.empty() == false, "EMPTY WHERE CLAUSE");
+
+	return create_formula_callable_definition(&items[0], &items[0] + items.size(), def);
+}
+
+class where_variables: public formula_callable {
+public:
+	where_variables(const formula_callable &base, where_variables_info_ptr info)
+	: formula_callable(false), base_(&base), info_(info)
+	{}
+private:
+	boost::intrusive_ptr<const formula_callable> base_;
+	where_variables_info_ptr info_;
+	
+	mutable std::vector<variant> results_cache_;
+
 	variant get_value_by_slot(int slot) const {
-		return base_.query_value_by_slot(slot);
+		if(slot >= info_->base_slot) {
+			slot -= info_->base_slot;
+			if(slot < results_cache_.size() && results_cache_[slot].is_null() == false) {
+				return results_cache_[slot];
+			} else {
+				variant result = info_->entries[slot]->evaluate(*base_);
+				if(results_cache_.size() <= slot) {
+					results_cache_.resize(slot+1);
+				}
+
+				results_cache_[slot] = result;
+				return result;
+			}
+		}
+
+		return base_->query_value_by_slot(slot);
 	}
 	
 	variant get_value(const std::string& key) const {
-		expr_table::iterator i = table_->find(key);
-		if(i != table_->end()) {
-			std::map<std::string, variant>::const_iterator itor = results_cache_.find(key);
-			if(itor != results_cache_.end()) {
-				return itor->second;
+		const variant result = base_->query_value(key);
+		if(result.is_null()) {
+			std::vector<std::string>::const_iterator i = std::find(info_->names.begin(), info_->names.end(), key);
+			if(i != info_->names.end()) {
+				const int slot = i - info_->names.begin();
+				return get_value_by_slot(info_->base_slot + slot);
 			}
-			
-			variant result = i->second->evaluate(base_);
-			results_cache_[key] = result;
-			return result;
 		}
-		return base_.query_value(key);
+		return result;
 	}
 };
 
 class where_expression: public formula_expression {
 public:
-	explicit where_expression(expression_ptr body,
-							  expr_table_ptr clauses)
-	: formula_expression("_where"), body_(body), clauses_(clauses)
-	{}
+	where_expression(expression_ptr body, where_variables_info_ptr info)
+	: formula_expression("_where"), body_(body), info_(info)
+	{
+	}
 	
 private:
 	expression_ptr body_;
-	expr_table_ptr clauses_;
+	where_variables_info_ptr info_;
 	
 	variant execute(const formula_callable& variables) const {
-		formula_callable_ptr wrapped_variables(new where_variables(variables, clauses_));
+		formula_callable_ptr wrapped_variables(new where_variables(variables, info_));
 		return body_->evaluate(*wrapped_variables);
 	}
 };
@@ -804,7 +916,7 @@ private:
 
 class decimal_expression : public formula_expression {
 public:
-	explicit decimal_expression(int64_t i, int64_t f) : formula_expression("_decimal"), v_(i*VARIANT_DECIMAL_PRECISION + f, variant::DECIMAL_VARIANT)
+	explicit decimal_expression(const decimal& d) : formula_expression("_decimal"), v_(d)
 	{}
 private:
 	variant execute(const formula_callable& /*variables*/) const {
@@ -825,10 +937,9 @@ public:
 				str = str.replace(pos, 2, "\n");
 			}
 			pos = 0;
-			//and remove tabs
-			while((pos = str.find("\t", pos)) != std::string::npos) {
-				str = str.replace(pos, 2, "");
-			}
+
+			str.erase(std::remove(str.begin(), str.end(), '\t'), str.end());
+
 			if (translate) {
 				str = i18n::tr(str);
 			}
@@ -846,11 +957,16 @@ public:
 			
 				substitution sub;
 				sub.pos = pos;
-				sub.calculation.reset(new formula(formula_str));
+				sub.calculation.reset(new formula(variant(formula_str)));
 				subs_.push_back(sub);
 			}
 		
 			std::reverse(subs_.begin(), subs_.end());
+
+			if(translate) {
+				str_ = variant::create_translated_string(str);
+				return;
+			}
 		} else if (translate) {
 			str = std::string("~") + str + std::string("~");
 		}
@@ -860,7 +976,7 @@ public:
 
 	variant is_literal() const {
 		if(subs_.empty()) {
-			return variant(str_);
+			return str_;
 		} else {
 			return variant();
 		}
@@ -927,22 +1043,45 @@ int operator_precedence(const token& t)
 	return precedence_map[std::string(t.begin,t.end)];
 }
 
-expression_ptr parse_expression(const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize=NULL);
+expression_ptr parse_expression(const variant& formula_str, const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize=NULL);
 
-void parse_function_args(const token* &i1, const token* i2,
+void parse_function_args(variant formula_str, const token* &i1, const token* i2,
 						 std::vector<std::string>* res,
-						 std::vector<std::string>* types)
+						 std::vector<std::string>* types,
+						 std::vector<variant>* default_values)
 {
 	if(i1->type == TOKEN_LPARENS) {
 		++i1;
 	} else {
-		std::cerr << "Invalid function definition" << std::endl;
-		throw formula_error();
+		ASSERT_LOG(false, "Invalid function definition\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
 	}
 	
 	while((i1->type != TOKEN_RPARENS) && (i1 != i2)) {
 		if(i1->type == TOKEN_IDENTIFIER) {
-			if(i1+1 != i2 && std::string((i1+1)->begin, (i1+1)->end) == "*") {
+			if(i1+1 != i2 && std::string((i1+1)->begin, (i1+1)->end) == "=") {
+				types->push_back("");
+				res->push_back(std::string(i1->begin, i1->end));
+
+				i1 += 2;
+				ASSERT_LOG(i1 != i2, "Invalid function definition\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
+
+				const token* begin = i1;
+				if(!token_matcher().add(TOKEN_COMMA).add(TOKEN_RPARENS)
+				    .find_match(i1, i2)) {
+					ASSERT_LOG(false, "Invalid function definition\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
+				}
+
+				const expression_ptr expr = parse_expression(
+				    formula_str, begin, i1, NULL, NULL);
+
+				boost::intrusive_ptr<map_formula_callable> callable(new map_formula_callable);
+				default_values->push_back(expr->evaluate(*callable));
+
+				continue;
+
+			} else if(default_values->empty() == false) {
+				ASSERT_LOG(i1 != i2, "Invalid function definition: some args do not have a default value after some args do\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
+			} else if(i1+1 != i2 && std::string((i1+1)->begin, (i1+1)->end) == "*") {
 				types->push_back("");
 				res->push_back(std::string(i1->begin, i1->end) + std::string("*"));
 				++i1;
@@ -957,20 +1096,18 @@ void parse_function_args(const token* &i1, const token* i2,
 		} else if (i1->type == TOKEN_COMMA) {
 			//do nothing
 		} else {
-			std::cerr << "Invalid function definition" << std::endl;
-			throw formula_error();
+			ASSERT_LOG(false, "Invalid function definition\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
 		}
 		++i1;
 	}
 	
 	if(i1->type != TOKEN_RPARENS) {
-		std::cerr << "Invalid function definition" << std::endl;
-		throw formula_error();
+		ASSERT_LOG(false, "Invalid function definition\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
 	}
 	++i1;
 }
 
-void parse_args(const token* i1, const token* i2,
+void parse_args(const variant& formula_str, const token* i1, const token* i2,
 				std::vector<expression_ptr>* res,
 				function_symbol_table* symbols,
 				const formula_callable_definition* callable_def,
@@ -985,7 +1122,7 @@ void parse_args(const token* i1, const token* i2,
 		} else if(i1->type == TOKEN_RPARENS || i1->type == TOKEN_RSQUARE || i1->type == TOKEN_RBRACKET) {
 			--parens;
 		} else if(i1->type == TOKEN_COMMA && !parens) {
-			res->push_back(parse_expression(beg,i1, symbols, callable_def, can_optimize));
+			res->push_back(parse_expression(formula_str, beg,i1, symbols, callable_def, can_optimize));
 			beg = i1+1;
 		}
 		
@@ -993,34 +1130,40 @@ void parse_args(const token* i1, const token* i2,
 	}
 	
 	if(beg != i1) {
-		res->push_back(parse_expression(beg,i1, symbols, callable_def, can_optimize));
+		res->push_back(parse_expression(formula_str, beg,i1, symbols, callable_def, can_optimize));
 	}
 }
 
-void parse_set_args(const token* i1, const token* i2,
+void parse_set_args(const variant& formula_str, const token* i1, const token* i2,
 					std::vector<expression_ptr>* res,
-					function_symbol_table* symbols)
+					function_symbol_table* symbols,
+				    const formula_callable_definition* callable_def)
 {
 	int parens = 0;
 	bool check_pointer = false;
 	const token* beg = i1;
 	while(i1 != i2) {
-		if(i1->type == TOKEN_LPARENS || i1->type == TOKEN_LSQUARE) {
+		if(i1->type == TOKEN_LPARENS || i1->type == TOKEN_LSQUARE || i1->type == TOKEN_LBRACKET) {
 			++parens;
-		} else if(i1->type == TOKEN_RPARENS || i1->type == TOKEN_RSQUARE) {
+		} else if(i1->type == TOKEN_RPARENS || i1->type == TOKEN_RSQUARE || i1->type == TOKEN_RBRACKET) {
 			--parens;
-		} else if( i1->type == TOKEN_POINTER && !parens ) {
+		} else if((i1->type == TOKEN_POINTER || i1->type == TOKEN_COLON) && !parens ) {
 			if (!check_pointer) {
 				check_pointer = true;
-				res->push_back(parse_expression(beg,i1, symbols, NULL));
+
+				if(i1 - beg == 1 && beg->type == TOKEN_IDENTIFIER) {
+					//make it so that {a: 4} is the same as {'a': 4}
+					res->push_back(expression_ptr(new string_expression(std::string(beg->begin, beg->end), false)));
+				} else {
+					res->push_back(parse_expression(formula_str, beg,i1, symbols, callable_def));
+				}
 				beg = i1+1;
 			} else {
-				std::cerr << "Too many '->' operators\n";
-				throw formula_error();
+				ASSERT_LOG(false, "Too many ':' operators.\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
 			}
 		} else if( i1->type == TOKEN_COMMA && !parens ) {
 			check_pointer = false;
-			res->push_back(parse_expression(beg,i1, symbols, NULL));
+			res->push_back(parse_expression(formula_str, beg,i1, symbols, callable_def));
 			beg = i1+1;
 		}
 		
@@ -1028,11 +1171,12 @@ void parse_set_args(const token* i1, const token* i2,
 	}
 	
 	if(beg != i1) {
-		res->push_back(parse_expression(beg,i1, symbols, NULL));
+		res->push_back(parse_expression(formula_str, beg,i1, symbols, callable_def));
 	}
 }
 
-void parse_where_clauses(const token* i1, const token * i2,
+void parse_where_clauses(const variant& formula_str,
+                         const token* i1, const token * i2,
 						 expr_table_ptr res, function_symbol_table* symbols,
 						 const formula_callable_definition* callable_def) {
 	int parens = 0;
@@ -1047,33 +1191,19 @@ void parse_where_clauses(const token* i1, const token * i2,
 		} else if(!parens) {
 			if(i1->type == TOKEN_COMMA) {
 				if(var_name.empty()) {
-					std::cerr << "There is 'where <expression>,; "
-					<< "'where name=<expression>,' was needed.\n";
-					throw formula_error();
+					ASSERT_LOG(false, "There is 'where <expression>,; "
+					<< "'where name=<expression>,' was needed.\n" <<
+					pinpoint_location(formula_str, i1->begin));
 				}
-				(*res)[var_name] = parse_expression(beg,i1, symbols, callable_def);
+				(*res)[var_name] = parse_expression(formula_str, beg,i1, symbols, callable_def);
 				beg = i1+1;
 				var_name = "";
 			} else if(i1->type == TOKEN_OPERATOR) {
 				std::string op_name(i1->begin, i1->end);
 				if(op_name == "=") {
-					if(beg->type != TOKEN_IDENTIFIER) {
-						if(i1 == original_i1_cached) {
-							std::cerr<< "There is 'where =<expression'; "
-							<< "'where name=<expression>' was needed.\n";
-						} else {
-							std::cerr<< "There is 'where <expression>=<expression>'; "
-							<< "'where name=<expression>' was needed.\n";
-						}
-						throw formula_error();
-					} else if(beg+1 != i1) {
-						std::cerr<<"There is 'where name <expression>=<expression>'; "
-						<< "'where name=<expression>' was needed.\n";
-						throw formula_error();
-					} else if(!var_name.empty()) {
-						std::cerr<<"There is 'where name=name=<expression>'; "
-						<<"'where name=<expression>' was needed.\n";
-						throw formula_error();
+					if(beg->type != TOKEN_IDENTIFIER || beg+1 != i1 || !var_name.empty()) {
+						ASSERT_LOG(false, "Unexpected tokens after where\n"
+						  << pinpoint_location(formula_str, i1->begin));
 					}
 					var_name.insert(var_name.end(), beg->begin, beg->end);
 					beg = i1+1;
@@ -1084,15 +1214,14 @@ void parse_where_clauses(const token* i1, const token * i2,
 	}
 	if(beg != i1) {
 		if(var_name.empty()) {
-			std::cerr << "There is 'where <expression>'; "
-			<< "'where name=<expression> was needed.\n";
-			throw formula_error();
+			ASSERT_LOG(false, "Unexpected tokens after where\n" <<
+			            pinpoint_location(formula_str, beg->begin));
 		}
-		(*res)[var_name] = parse_expression(beg,i1, symbols, callable_def);
+		(*res)[var_name] = parse_expression(formula_str, beg,i1, symbols, callable_def);
 	}
 }
 
-expression_ptr parse_expression_internal(const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize=NULL);
+expression_ptr parse_expression_internal(const variant& formula_str, const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize=NULL);
 
 namespace {
 	
@@ -1137,7 +1266,7 @@ struct static_context {
 
 expression_ptr optimize_expression(expression_ptr result, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool reduce_to_static)
 {
-	const std::string str = result->str();
+	expression_ptr original = result;
 
 	if(reduce_to_static) {
 		//we want to try to evaluate this expression, and see if it is static.
@@ -1176,17 +1305,17 @@ expression_ptr optimize_expression(expression_ptr result, function_symbol_table*
 	}
 	
 	if(result) {
-		result->set_str(str);
+		result->copy_debug_info_from(*original);
 	}
 
 	return result;
 }
 
-expression_ptr parse_expression(const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize)
+expression_ptr parse_expression(const variant& formula_str, const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize)
 {
 	bool optimize = true;
-	expression_ptr result(parse_expression_internal(i1, i2, symbols, callable_def, &optimize));
-	result->set_str(std::string(i1->begin, (i2-1)->end));
+	expression_ptr result(parse_expression_internal(formula_str, i1, i2, symbols, callable_def, &optimize));
+	result->set_debug_info(formula_str, i1->begin, (i2-1)->end);
 
 	result = optimize_expression(result, symbols, callable_def, optimize);
 
@@ -1197,65 +1326,96 @@ expression_ptr parse_expression(const token* i1, const token* i2, function_symbo
 	return result;
 }
 
-expression_ptr parse_expression_internal(const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize)
+//only returns a value in the case of a lambda function, otherwise
+//returns NULL.
+expression_ptr parse_function_def(const variant& formula_str, const token*& i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def)
 {
-	if(i1 == i2) {
-		std::cerr << "empty expression\n";
-		throw formula_error();
+	assert(i1->type == TOKEN_KEYWORD && std::string(i1->begin, i1->end) == "def");
+
+	++i1;
+
+	std::string formula_name;
+	if(i1->type == TOKEN_IDENTIFIER) {
+		formula_name = std::string(i1->begin, i1->end);
+		++i1;
 	}
 	
-	if(i1->type == TOKEN_KEYWORD && std::string(i1->begin, i1->end) == "def" &&
-	   ((i1+1)->type == TOKEN_IDENTIFIER || (i1+1)->type == TOKEN_LPARENS)) {
+	std::vector<std::string> args, types;
+	std::vector<variant> default_args;
+	parse_function_args(formula_str, i1, i2, &args, &types, &default_args);
+	const token* beg = i1;
+	while((i1 != i2) && (i1->type != TOKEN_SEMICOLON)) {
 		++i1;
-		std::string formula_name;
-		if(i1->type == TOKEN_IDENTIFIER) {
-			formula_name = std::string(i1->begin, i1->end);
-			++i1;
-		}
-		
-		std::vector<std::string> args, types;
-		parse_function_args(i1, i2, &args, &types);
-		const token* beg = i1;
-		while((i1 != i2) && (i1->type != TOKEN_SEMICOLON)) {
-			++i1;
-		}
-		const std::string formula_str = std::string(beg->begin, (i1-1)->end);
-		
-		recursive_function_symbol_table recursive_symbols(formula_name.empty() ? "recurse" : formula_name, args, symbols);
-
-		formula_callable_definition_ptr args_definition;
-		if(formula_name.empty() == false) {
-			//create a definition of the callable representing
-			//function arguments.
-			args_definition = create_formula_callable_definition(&args[0], &args[0] + args.size());
-			for(int n = 0; n != types.size(); ++n) {
-				if(types[n].empty()) {
-					continue;
-				}
-
-				ASSERT_LOG(args_definition->get_entry(n) != NULL, "FORMULA FUNCTION TYPE ARGS MIS-MATCH");
-
-				const formula_callable_definition* def = get_formula_callable_definition(types[n]);
-				ASSERT_LOG(def != NULL, "TYPE NOT FOUND: " << types[n]);
-				args_definition->get_entry(n)->type_definition = def;
+	}
+	const std::string function_str = std::string(beg->begin, (i1-1)->end);
+	variant function_var(function_str);
+	if(formula_str.get_debug_info()) {
+		//Set the debugging info for this new string, adjusting relative
+		//to our parent formula, so we know where in the file it lies.
+		const variant::debug_info* cur_info = formula_str.get_debug_info();
+		variant::debug_info info = *cur_info;
+		for(std::string::const_iterator i = formula_str.as_string().begin();
+		    i != beg->begin; ++i) {
+			if(*i == '\n') {
+				info.line++;
+				info.column = 0;
+			} else {
+				info.column++;
 			}
 		}
 
-		const_formula_ptr fml(new formula(formula_str, &recursive_symbols, args_definition.get()));
-		recursive_symbols.resolve_recursive_calls(fml);
-		
-		if(formula_name.empty()) {
-			return expression_ptr(new lambda_function_expression(args, fml));
+		function_var.set_debug_info(info);
+	}
+	
+	recursive_function_symbol_table recursive_symbols(formula_name.empty() ? "recurse" : formula_name, args, default_args, symbols, formula_name.empty() ? callable_def : NULL);
+
+	//create a definition of the callable representing
+	//function arguments.
+	formula_callable_definition_ptr args_definition = create_formula_callable_definition(&args[0], &args[0] + args.size(), formula_name.empty() ? callable_def : NULL /*only get the surrounding scope if we have a lambda function.*/);
+	if(formula_name.empty() == false) {
+		for(int n = 0; n != types.size(); ++n) {
+			if(types[n].empty()) {
+				continue;
+			}
+
+			ASSERT_LOG(args_definition->get_entry(n) != NULL, "FORMULA FUNCTION TYPE ARGS MIS-MATCH\n" << pinpoint_location(formula_str, i1->begin, i1->end));
+
+			const formula_callable_definition* def = get_formula_callable_definition(types[n]);
+			ASSERT_LOG(def != NULL, "TYPE NOT FOUND: " << types[n] << "\n" << pinpoint_location(formula_str, i1->begin, i1->end));
+			args_definition->get_entry(n)->type_definition = def;
 		}
-		
-		const std::string precond = "";
-		symbols->add_formula_function(formula_name, fml,
-									  formula::create_optional_formula(precond, symbols), args);
+	}
+
+	const_formula_ptr fml(new formula(function_var, &recursive_symbols, args_definition.get()));
+	recursive_symbols.resolve_recursive_calls(fml);
+	
+	if(formula_name.empty()) {
+		return expression_ptr(new lambda_function_expression(args, fml, callable_def ? callable_def->num_slots() : 0, default_args));
+	}
+
+	const std::string precond = "";
+	symbols->add_formula_function(formula_name, fml,
+								  formula::create_optional_formula(variant(precond), symbols), args, default_args);
+	return expression_ptr();
+}
+
+expression_ptr parse_expression_internal(const variant& formula_str, const token* i1, const token* i2, function_symbol_table* symbols, const formula_callable_definition* callable_def, bool* can_optimize)
+{
+	ASSERT_LOG(i1 != i2, "Empty expression in formula\n" << pinpoint_location(formula_str, (i1-1)->end));
+	
+	if(symbols && i1->type == TOKEN_KEYWORD && std::string(i1->begin, i1->end) == "def" &&
+	   ((i1+1)->type == TOKEN_IDENTIFIER || (i1+1)->type == TOKEN_LPARENS)) {
+
+		expression_ptr lambda = parse_function_def(formula_str, i1, i2, symbols, callable_def);
+		if(lambda) {
+			return lambda;
+		}
+
 		if((i1 == i2) || (i1 == (i2-1))) {
 			return expression_ptr(new function_list_expression(symbols));
 		}
 		else {
-			return parse_expression((i1+1), i2, symbols, callable_def, can_optimize);
+			return parse_expression(formula_str, (i1+1), i2, symbols, callable_def, can_optimize);
 		}
 	}
 	
@@ -1299,7 +1459,7 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 	
 	if(op == NULL) {
 		if(i1->type == TOKEN_LPARENS && (i2-1)->type == TOKEN_RPARENS) {
-			return parse_expression(i1+1,i2-1,symbols, callable_def, can_optimize);
+			return parse_expression(formula_str, i1+1,i2-1,symbols, callable_def, can_optimize);
 		} else if( (i2-1)->type == TOKEN_RSQUARE) { //check if there is [ ] : either a list definition, or a operator 
 			const token* tok = i2-2;
 			int square_parens = 0;
@@ -1313,10 +1473,46 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 			}	
 			if (tok->type == TOKEN_LSQUARE) {
 				if (tok == i1) {
-					//create a list
-					std::vector<expression_ptr> args;
-					parse_args(i1+1,i2-1,&args,symbols, callable_def, can_optimize);
-					return expression_ptr(new list_expression(args));
+					const token* pipe = i1+1;
+					if(token_matcher().add(TOKEN_PIPE).find_match(pipe, i2)) {
+						//a list comprehension
+						expression_ptr expr = parse_expression(formula_str, i1+1, pipe, symbols, callable_def, can_optimize);
+
+						typedef std::pair<const token*,const token*> Arg;
+						std::vector<Arg> args;
+						const token* arg = pipe+1;
+						const token* end_arg = arg;
+						while(token_matcher().add(TOKEN_COMMA).find_match(end_arg, i2-1)) {
+							args.push_back(Arg(arg, end_arg));
+							arg = ++end_arg;
+						}
+						args.push_back(Arg(arg, i2-1));
+
+						std::map<std::string, expression_ptr> generators;
+						std::vector<expression_ptr> filter_expr;
+
+						foreach(const Arg& arg, args) {
+							std::cerr << "ARGUMENT: (((" << std::string(arg.first->begin, (arg.second-1)->end) << ")))\n";
+							const token* arrow = arg.first;
+							if(token_matcher().add(TOKEN_LEFT_POINTER).find_match(arrow, arg.second)) {
+								ASSERT_LOG(arrow - arg.first == 1 && arg.first->type == TOKEN_IDENTIFIER, "expected identifier to the left of <- in list comprehension\n" << pinpoint_location(formula_str, arg.first->begin, arrow->end));
+
+								const std::string key(arg.first->begin, arg.first->end);
+								ASSERT_LOG(generators.count(key) == 0, "repeated identifier in list generator: " << key << "\n" << pinpoint_location(formula_str, arg.first->begin, arrow->end));
+
+								generators[key] = parse_expression(formula_str, arrow+1, arg.second, symbols, callable_def, can_optimize);
+							} else {
+								filter_expr.push_back(parse_expression(formula_str, arg.first, arg.second, symbols, callable_def, can_optimize));
+							}
+						}
+
+						return expression_ptr(new list_comprehension_expression(expr, generators, filter_expr));
+					} else {
+						//create a list
+						std::vector<expression_ptr> args;
+						parse_args(formula_str,i1+1,i2-1,&args,symbols, callable_def, can_optimize);
+						return expression_ptr(new list_expression(args));
+					}
 				} else {
 					//determine if it's an array-style access of a single list element, or a slice.
 					const token* tok2 = i2-2;
@@ -1344,33 +1540,39 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 					if(colon_tok != NULL){
 						expression_ptr start, end;
 						if(tok+1 < colon_tok) {
-							start = parse_expression(tok+1, colon_tok, symbols, callable_def, can_optimize);
+							start = parse_expression(formula_str, tok+1, colon_tok, symbols, callable_def, can_optimize);
 						}
 
 						if(colon_tok+1 < i2-1) {
-							end = parse_expression(colon_tok+1, i2-1, symbols, callable_def, can_optimize);
+							end = parse_expression(formula_str, colon_tok+1, i2-1, symbols, callable_def, can_optimize);
 						}
 
 						//it's a slice.  execute operator [ : ]
 						return expression_ptr(new slice_square_bracket_expression(
-																			parse_expression(i1,tok,symbols, callable_def, can_optimize), start, end));
+																			parse_expression(formula_str, i1,tok,symbols, callable_def, can_optimize), start, end));
 					}else{	
 						//execute operator [ ]
 						return expression_ptr(new square_bracket_expression(
-																			parse_expression(i1,tok,symbols, callable_def, can_optimize),
-																			parse_expression(tok+1,i2-1,symbols, callable_def, can_optimize)));
+																			parse_expression(formula_str, i1,tok,symbols, callable_def, can_optimize),
+																			parse_expression(formula_str, tok+1,i2-1,symbols, callable_def, can_optimize)));
 					}
 				}
 			}
 		} else if(i1->type == TOKEN_LBRACKET && (i2-1)->type == TOKEN_RBRACKET) {
 			//create a map TODO: add support for a set
 			std::vector<expression_ptr> args;
-			parse_set_args(i1+1,i2-1,&args,symbols);
+			parse_set_args(formula_str,i1+1,i2-1,&args,symbols,callable_def);
 			return expression_ptr(new map_expression(args));
 		} else if(i2 - i1 == 1) {
 			if(i1->type == TOKEN_KEYWORD) {
 				if(std::string(i1->begin,i1->end) == "functions") {
 					return expression_ptr(new function_list_expression(symbols));
+				} else if(std::string(i1->begin,i1->end) == "null") {
+					return expression_ptr(new null_expression());
+				} else if(std::string(i1->begin,i1->end) == "true") {
+					return expression_ptr(new variant_expression(variant::from_bool(true)));
+				} else if(std::string(i1->begin,i1->end) == "false") {
+					return expression_ptr(new variant_expression(variant::from_bool(false)));
 				}
 			} else if(i1->type == TOKEN_CONST_IDENTIFIER) {
 				return expression_ptr(new const_identifier_expression(
@@ -1379,30 +1581,26 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 				if(can_optimize) {
 					*can_optimize = false;
 				}
-				return expression_ptr(new identifier_expression(
-																std::string(i1->begin,i1->end), callable_def));
+
+				std::string symbol(i1->begin, i1->end);
+				identifier_expression* expr =
+				    new identifier_expression(symbol, callable_def);
+				const formula_function* fn = symbols ? symbols->get_formula_function(symbol) : NULL;
+				if(fn != NULL) {
+					expression_ptr function(new lambda_function_expression(fn->args(), fn->get_formula(), 0, fn->default_args()));
+					expr->set_function(function);
+				}
+				return expression_ptr(expr);
 			} else if(i1->type == TOKEN_INTEGER) {
 				int n = strtol(std::string(i1->begin,i1->end).c_str(), NULL, 0);
 				return expression_ptr(new integer_expression(n));
 			} else if(i1->type == TOKEN_DECIMAL) {
-				char* endptr = NULL;
-				char* enddec = NULL;
-				int64_t n = strtol(std::string(i1->begin,i1->end).c_str(), &endptr, 0);
-				int64_t m = strtol(endptr+1, &enddec, 0);
-				int dist = enddec - endptr;
-				while(dist > (DECIMAL_PLACES+1)) {
-					m /= 10;
-					--dist;
-				}
-				while(dist < (DECIMAL_PLACES+1)) {
-					m *= 10;
-					++dist;
-				}
-
-				return expression_ptr(new decimal_expression(n, m));
+				std::string decimal_string(i1->begin, i1->end);
+				return expression_ptr(new decimal_expression(decimal::from_string(decimal_string)));
 			} else if(i1->type == TOKEN_STRING_LITERAL) {
 				bool translate = *(i1->begin) == '~';
-				return expression_ptr(new string_expression(std::string(i1->begin+1,i1->end-1), translate));
+				int add = *(i1->begin) == 'q' ? 2 : 1;
+				return expression_ptr(new string_expression(std::string(i1->begin+add,i1->end-1), translate));
 			}
 		} else if(i1->type == TOKEN_IDENTIFIER &&
 				  (i1+1)->type == TOKEN_LPARENS &&
@@ -1419,8 +1617,7 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 			if(nleft == nright) {
 				const std::string function_name(i1->begin, i1->end);
 				std::vector<expression_ptr> args;
-				const bool optimize = optimize_function_arguments(function_name, symbols);
-				parse_args(i1+2,i2-1,&args,symbols, optimize ? callable_def : NULL, can_optimize);
+				parse_args(formula_str,i1+2,i2-1,&args,symbols, callable_def, can_optimize);
 				expression_ptr result(create_function(function_name, args, symbols, callable_def));
 				if(result) {
 					return result;
@@ -1448,15 +1645,15 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 					++match;
 					ASSERT_LT(match, i2); 
 
-					std::cerr << "unexpected tokens after function call: '" << std::string(match->begin, (i2-1)->end) << "'\n";
+					ASSERT_LOG(false, "unexpected tokens after function call\n" << pinpoint_location(formula_str, match->begin, (i2-1)->end));
 				} else {
-					std::cerr << "no closing parenthesis to function call: '" << std::string(i1->begin, (i2-1)->end) << "'\n";
+					ASSERT_LOG(false, "no closing parenthesis to function call\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
 				}
 			} else {
-				std::cerr << "could not parse expression: '" << std::string(i1->begin, (i2-1)->end) << "'\n";
+				ASSERT_LOG(false, "could not parse expression\n" << pinpoint_location(formula_str, i1->begin, (i2-1)->end));
 			}
 
-			throw formula_error();
+			assert(false); //should never reach here.
 		}
 	}
 	
@@ -1466,48 +1663,59 @@ expression_ptr parse_expression_internal(const token* i1, const token* i2, funct
 	}
 	
 	if(op == i1) {
+		if(op+1 == i2) {
+			std::cerr << "No expression for operator '" << std::string(op->begin,op->end) << "' to operate on\n";
+		}
 		return expression_ptr(new unary_operator_expression(
 															std::string(op->begin,op->end),
-															parse_expression(op+1,i2,symbols, callable_def, can_optimize)));
+															parse_expression(formula_str, op+1,i2,symbols, callable_def, can_optimize)));
 	}
 	
 	const std::string op_name(op->begin,op->end);
 	
 	if(op_name == "(") {
 		if(i2 - op < 2) {
-			std::cerr << "MISSING PARENS IN FORMULA\n";
-			throw formula_error();
+			ASSERT_LOG(false, "MISSING PARENS IN FORMULA\n" << pinpoint_location(formula_str, op->begin, op->end));
 		}
 
 		std::vector<expression_ptr> args;
-		parse_args(op+1, i2-1, &args, symbols, callable_def, can_optimize);
+		parse_args(formula_str,op+1, i2-1, &args, symbols, callable_def, can_optimize);
 		
 		return expression_ptr(new function_call_expression(
-														   parse_expression(i1, op, symbols, callable_def, can_optimize), args));
+														   parse_expression(formula_str, i1, op, symbols, callable_def, can_optimize), args));
 	}
 	
 	if(op_name == ".") {
-		expression_ptr left(parse_expression(i1,op,symbols, callable_def, can_optimize));
+		expression_ptr left(parse_expression(formula_str, i1,op,symbols, callable_def, can_optimize));
 		const formula_callable_definition* type_definition = left->get_type_definition();
 		//TODO: right now we don't give the right side of the dot
 		//a expression definition. We should work out if we can
 		//statically derive information from the left half to
 		//give the right half a definition.
 		return expression_ptr(new dot_expression(left,
-												 parse_expression(op+1,i2,symbols, type_definition, can_optimize)));
+												 parse_expression(formula_str, op+1,i2,NULL, type_definition, can_optimize)));
 	}
 	
 	if(op_name == "where") {
+		const int base_slots = callable_def ? callable_def->num_slots() : 0;
+		where_variables_info_ptr where_info(new where_variables_info(base_slots));
+
 		expr_table_ptr table(new expr_table());
-		parse_where_clauses(op+1, i2, table, symbols, callable_def);
-		return expression_ptr(new where_expression(parse_expression(i1, op, symbols, callable_def, can_optimize),
-												   table));
+		parse_where_clauses(formula_str, op+1, i2, table, symbols, callable_def);
+		std::vector<expression_ptr> entries;
+		for(expr_table::iterator i = table->begin(); i != table->end(); ++i) {
+			where_info->names.push_back(i->first);
+			where_info->entries.push_back(i->second);
+		}
+
+		const_formula_callable_definition_ptr callable_where_def = create_where_definition(table, callable_def);
+		return expression_ptr(new where_expression(parse_expression(formula_str, i1, op, symbols, callable_where_def.get(), can_optimize), where_info));
 	}
 
 	const bool is_dot = op_name == ".";
 	return expression_ptr(new operator_expression(
-												  op_name, parse_expression(i1,op,symbols, callable_def, can_optimize),
-												  parse_expression(op+1,i2,symbols, callable_def, can_optimize)));
+												  op_name, parse_expression(formula_str, i1,op,symbols, callable_def, can_optimize),
+												  parse_expression(formula_str, op+1,i2,symbols, callable_def, can_optimize)));
 }
 }
 
@@ -1525,131 +1733,237 @@ formula_ptr formula::create_string_formula(const std::string& str)
 	return res;
 }
 
-formula_ptr formula::create_optional_formula(const wml::value& val, function_symbol_table* symbols, const formula_callable_definition* callable_definition)
+formula_ptr formula::create_optional_formula(const variant& val, function_symbol_table* symbols, const formula_callable_definition* callable_definition)
 {
-	if(val.empty()) {
+	if(val.is_null() || val.is_string() && val.as_string().empty()) {
 		return formula_ptr();
 	}
 	
 	try {
 		return formula_ptr(new formula(val, symbols, callable_definition));
 	} catch(...) {
-		if(val.filename()) {
-			std::cerr << *val.filename() << " " << val.line() << ": ";
-		}
+//TODO: add detection of where the variant came from.
+//		if(val.filename()) {
+//			std::cerr << *val.filename() << " " << val.line() << ": ";
+//		}
 		
-		std::cerr << "ERROR parsing optional formula: '" << val << "'\n";
 		//for now die a horrible death on such errors
-		assert(false);
+		ASSERT_LOG(false, "ERROR parsing optional formula '" << val.as_string() << "'");
 		
 		return formula_ptr();
 	}
 }
 
-formula::formula(const wml::value& val, function_symbol_table* symbols, const formula_callable_definition* callable_definition) : str_(val.str()), filename_(val.filename()), line_(val.line())
+formula::formula(const variant& val, function_symbol_table* symbols, const formula_callable_definition* callable_definition) : str_(val)
 {
 	using namespace formula_tokenizer;
-	
+
+	function_symbol_table symbol_table;
+	if(!symbols) {
+		symbols = &symbol_table;
+	}
+
+	if(str_.is_int() || str_.is_bool() || str_.is_decimal()) {
+		//Allow ints, bools, and decimals to be interpreted as formulae.
+		str_ = variant(str_.string_cast());
+	}
+
 	std::vector<token> tokens;
-	std::string::const_iterator i1 = str_.begin(), i2 = str_.end();
+	std::string::const_iterator i1 = str_.as_string().begin(), i2 = str_.as_string().end();
 	while(i1 != i2) {
 		try {
 			tokens.push_back(get_token(i1,i2));
 			if((tokens.back().type == TOKEN_WHITESPACE) || (tokens.back().type == TOKEN_COMMENT)) {
 				tokens.pop_back();
 			}
-		} catch(token_error& /*e*/) {
-			throw formula_error();
+		} catch(token_error& e) {
+			ASSERT_LOG(false, "Token error: " << e.msg << ": " << pinpoint_location(str_, i1, i1));
 		}
 	}
 
-	//check that all kinds of brackets match up.
-	{
-		std::string error_msg;
-		int error_loc = -1;
+	check_brackets_match(tokens);
 
-		std::stack<formula_tokenizer::FFL_TOKEN_TYPE> brackets;
-		std::stack<int> brackets_locs;
-		for(int n = 0; n != tokens.size(); ++n) {
-			switch(tokens[n].type) {
-			case TOKEN_LPARENS:
-			case TOKEN_LSQUARE:
-			case TOKEN_LBRACKET:
-				brackets.push(tokens[n].type);
-				brackets_locs.push(n);
-				break;
-			case TOKEN_RPARENS:
-			case TOKEN_RSQUARE:
-			case TOKEN_RBRACKET:
-				if(brackets.empty()) {
-					error_msg = "UNEXPECTED TOKEN: " + std::string(tokens[n].begin, tokens[n].end);
-					error_loc = n;
-					break;
-				} else if(brackets.top() != tokens[n].type-1) {
-					const int m = brackets_locs.top();
-					error_msg = "UNMATCHED BRACKET: " + std::string(tokens[m].begin, tokens[m].end);
-					error_loc = m;
-					break;
-				}
+	if(tokens.size() != 0) {
+		const_formula_callable_definition_ptr global_where_def;
 
-				brackets.pop();
-				brackets_locs.pop();
-				break;
-			}
-		}
+		const token* tok = &tokens[0];
+		const token* end_tokens = &tokens[0] + tokens.size();
 
-		if(brackets.empty() == false) {
-			const int m = brackets_locs.top();
-			error_msg = "UNMATCHED BRACKET: " + std::string(tokens[m].begin, tokens[m].end);
-			error_loc = m;
-		}
+		if(tokens[0].type == TOKEN_KEYWORD && std::string(tokens[0].begin, tokens[0].end) == "base") {
 
-		if(error_loc != -1) {
-			const token& tok = tokens[error_loc];
-			std::string::const_iterator begin_line = tokens.front().begin;
-			std::string::const_iterator i = begin_line;
-			int nline = 0;
-			while(i < tok.begin) {
-				if(i == tok.begin) {
-					break;
-				}
-
-				if(*i == '\n') {
-					++nline;
-					begin_line = i+1;
-				}
-				++i;
+			const token* recursive_case = tok;
+			if(!token_matcher(TOKEN_KEYWORD).add("recursive").find_match(recursive_case, end_tokens)) {
+				ASSERT_LOG(false, "ERROR WHILE PARSING FORMULA: NO RECURSIVE CASE FOUND");
 			}
 
-			const std::string::const_iterator end_line = std::find(begin_line, tokens.back().end, '\n');
-			while(begin_line < end_line && util::isspace(*begin_line)) {
-				++begin_line;
+
+			const token* where_tok = recursive_case;
+
+			if(token_matcher(TOKEN_OPERATOR).add("where").find_match(where_tok, end_tokens)) {
+				global_where_.reset(new where_variables_info(callable_definition ? callable_definition->num_slots() : 0));
+				expr_table_ptr table(new expr_table());
+				parse_where_clauses(str_, where_tok+1, end_tokens, table, symbols, callable_definition);
+				for(expr_table::iterator i = table->begin(); i != table->end(); ++i) {
+					global_where_->names.push_back(i->first);
+					global_where_->entries.push_back(i->second);
+				}
+
+				global_where_def = create_where_definition(table, callable_definition);
+				callable_definition = global_where_def.get();
+
+				end_tokens = where_tok;
 			}
 
-			std::string whitespace(begin_line, tok.begin);
-			std::fill(whitespace.begin(), whitespace.end(), ' ');
+			while(tok->type == TOKEN_KEYWORD && std::string(tok->begin, tok->end) == "base") {
+				++tok;
 
-			std::cerr << std::string(begin_line, tok.begin) << "\n";
+				const token* colon_ptr = tok;
 
-			ASSERT_LOG(false, "ERROR WHILE PARSING FORMULA AT "
-			  << (filename_ ? *filename_ : "UNKNOWN") << ":"
-			  << (line_ + nline) << " " << error_msg << "\n"
-			  << std::string(begin_line, end_line) << "\n"
-			  << whitespace << "^\n");
+				if(!token_matcher(TOKEN_COLON).find_match(colon_ptr, end_tokens)) {
+					ASSERT_LOG(false, "ERROR WHILE PARSING FORMULA: ':' EXPECTED AFTER BASE");
+				}
+
+				const token* end_ptr = colon_ptr;
+
+				if(!token_matcher(TOKEN_KEYWORD).add("base").add("recursive").find_match(end_ptr, end_tokens)) {
+					ASSERT_LOG(false, "ERROR WHILE PARSING FORMULA: NO RECURSIVE CASE FOUND");
+				}
+
+				BaseCase base;
+				base.raw_guard = base.guard = parse_expression(str_, tok, colon_ptr, symbols, callable_definition);
+				base.expr = parse_expression(str_, colon_ptr+1, end_ptr, symbols, callable_definition);
+
+				base_expr_.push_back(base);
+
+				tok = end_ptr;
+			}
+
+			//check that the part before the actual formula is recursive:
+			ASSERT_LOG(tok + 2 < end_tokens && tok->type == TOKEN_KEYWORD && std::string(tok->begin, tok->end) == "recursive" && (tok+1)->type == TOKEN_COLON, "RECURSIVE CASE NOT FOUND");
+
+			tok += 2;
+
 		}
-	}
-	
-	try {
-		if(tokens.size() != 0) {
-			expr_ = parse_expression(&tokens[0],&tokens[0] + tokens.size(), symbols, callable_definition);
-		} else {
-			expr_ = expression_ptr(new null_expression());
-		}	
-	} catch(formula_error&) {
-		std::cerr << "ERROR WHILE PARSING AT " << (filename_ ? *filename_ : "UNKNOWN") << ":" << line_ << "::\n" << str_ << "\n";
-		throw;
+
+		expr_ = parse_expression(str_, tok, end_tokens, symbols, callable_definition);
+
+		if(global_where_) {
+			expr_.reset(new where_expression(expr_, global_where_));
+			foreach(BaseCase& base, base_expr_) {
+				base.guard.reset(new where_expression(base.guard, global_where_));
+				base.expr.reset(new where_expression(base.expr, global_where_));
+			}
+		}
+	} else {
+		expr_ = expression_ptr(new null_expression());
+	}	
+}
+
+const_formula_callable_ptr formula::wrap_callable_with_global_where(const formula_callable& callable) const
+{
+	if(global_where_) {
+		const_formula_callable_ptr wrapped_variables(new where_variables(callable, global_where_));
+		return wrapped_variables;
+	} else {
+		return const_formula_callable_ptr(&callable);
 	}
 }
+
+void formula::check_brackets_match(const std::vector<token>& tokens) const
+{
+	std::string error_msg;
+	int error_loc = -1;
+
+	std::stack<formula_tokenizer::FFL_TOKEN_TYPE> brackets;
+	std::stack<int> brackets_locs;
+	for(int n = 0; n != tokens.size(); ++n) {
+		switch(tokens[n].type) {
+		case TOKEN_LPARENS:
+		case TOKEN_LSQUARE:
+		case TOKEN_LBRACKET:
+			brackets.push(tokens[n].type);
+			brackets_locs.push(n);
+			break;
+		case TOKEN_RPARENS:
+		case TOKEN_RSQUARE:
+		case TOKEN_RBRACKET:
+			if(brackets.empty()) {
+				error_msg = "UNEXPECTED TOKEN: " + std::string(tokens[n].begin, tokens[n].end);
+				error_loc = n;
+				break;
+			} else if(brackets.top() != tokens[n].type-1) {
+				const int m = brackets_locs.top();
+				error_msg = "UNMATCHED BRACKET: " + std::string(tokens[m].begin, tokens[m].end);
+				error_loc = m;
+				break;
+			}
+
+			brackets.pop();
+			brackets_locs.pop();
+			break;
+		}
+	}
+
+	if(brackets.empty() == false) {
+		const int m = brackets_locs.top();
+		error_msg = "UNMATCHED BRACKET: " + std::string(tokens[m].begin, tokens[m].end);
+		error_loc = m;
+	}
+
+	if(error_loc != -1) {
+		const token& tok = tokens[error_loc];
+		std::string::const_iterator begin_line = tokens.front().begin;
+		std::string::const_iterator i = begin_line;
+		int nline = 0;
+		while(i < tok.begin) {
+			if(i == tok.begin) {
+				break;
+			}
+
+			if(*i == '\n') {
+				++nline;
+				begin_line = i+1;
+			}
+			++i;
+		}
+
+		const std::string::const_iterator end_line = std::find(begin_line, tokens.back().end, '\n');
+		while(begin_line < end_line && util::c_isspace(*begin_line)) {
+			++begin_line;
+		}
+
+		std::string whitespace(begin_line, tok.begin);
+		std::fill(whitespace.begin(), whitespace.end(), ' ');
+		std::string error_line(begin_line, end_line);
+
+		if(whitespace.size() > 40) {
+			const int erase_size = whitespace.size() - 60;
+			whitespace.erase(whitespace.begin(), whitespace.begin() + erase_size);
+			ASSERT_LOG(erase_size <= error_line.size(), "ERROR WHILE PARSING ERROR MESSAGE");
+			error_line.erase(error_line.begin(), error_line.begin() + erase_size);
+			std::fill(error_line.begin(), error_line.begin() + 3, '.');
+		}
+
+		if(error_line.size() > 78) {
+			error_line.resize(78);
+			std::fill(error_line.end()-3, error_line.end(), '.');
+		}
+		
+
+		std::string location;
+		const variant::debug_info* dbg_info = str_.get_debug_info();
+		if(dbg_info) {
+			location = formatter() << " AT " << *dbg_info->filename
+		                           << " " << dbg_info->line;
+		}
+		//TODO: extract info from str_ about the location of the formula.
+		ASSERT_LOG(false, "ERROR WHILE PARSING FORMULA" << location << ": "
+		  << error_msg << "\n"
+		  << error_line << "\n"
+		  << whitespace << "^\n");
+	}
+}
+
 
 formula::~formula() {
 	if(last_executed_formula == this) {
@@ -1659,29 +1973,80 @@ formula::~formula() {
 
 void formula::output_debug_info() const
 {
-	std::cerr << "FORMULA: ";
-	if(filename_) {
-		std::cerr << *filename_ << " " << line_ << ": ";
-	}
+	std::cerr << "FORMULA: " << (str_.get_debug_info() ? str_.get_debug_info()->message() : "(UNKNOWN LOCATION): ");
+	//TODO: add debug info from str_ variant here.
 	
-	std::cerr << str_ << "\n";
+	std::cerr << str_.as_string() << "\n";
+}
+
+int formula::guard_matches(const formula_callable& variables) const
+{
+	if(base_expr_.empty() == false) {
+		int index = 0;
+		foreach(const BaseCase& b, base_expr_) {
+			if(b.guard->evaluate(variables).as_bool()) {
+				return index;
+			}
+
+			++index;
+		}
+	}
+
+	return -1;
+}
+
+int formula::raw_guard_matches(const formula_callable& variables) const
+{
+	if(base_expr_.empty() == false) {
+		int index = 0;
+		foreach(const BaseCase& b, base_expr_) {
+			if(b.raw_guard->evaluate(variables).as_bool()) {
+				return index;
+			}
+
+			++index;
+		}
+	}
+
+	return -1;
 }
 
 variant formula::execute(const formula_callable& variables) const
 {
+	//We want to track the 'last executed' formula in last_executed_formula,
+	//so we can use it for debugging purposes if there's a problem.
+	//If one formula calls another, we want to restore the old value after
+	//the nested formula exits. However, when a formula returns, if it's
+	//the top-level formula we want to still keep it recorded as the
+	//last executed, so we can complain about it if any commands it returns
+	//have problems.
+	//
+	//As such we track the depth of the execution stack so we can tell if
+	//we're a top-level formula or not. If we're a nested formula we restore
+	//last_executed_formula upon return.
+	//
+	//Naturally if we throw an exception we DON'T want to restore the
+	//last_executed_formula since we want to report the error.
+	static int execution_stack = 0;
+	const formula* prev_executed = execution_stack ? last_executed_formula : NULL;
 	last_executed_formula = this;
 	try {
-		return expr_->evaluate(variables);
-	} catch(type_error& e) {
-		if(filename_) {
-			std::cerr << *filename_ << " " << line_ << ": ";
+		++execution_stack;
+
+		const int nguard = guard_matches(variables);
+
+		variant result = (nguard == -1 ? expr_ : base_expr_[nguard].expr)->evaluate(variables);
+		--execution_stack;
+		if(prev_executed) {
+			last_executed_formula = prev_executed;
 		}
-		std::cerr << "formula type error: " << e.message << "\n";
-		
-		//for now die a horrible death on a formula type error
-		assert(false);
-		return variant();
+		return result;
+	} catch(std::string& e) {
+//		output_debug_info();
+//		ASSERT_LOG(false, "formula type error: " << e.message << "\n");
 	}
+
+	ASSERT_LOG(false, "");
 }
 
 variant formula::execute() const
@@ -1693,26 +2058,30 @@ variant formula::execute() const
 	return execute(*null_callable);
 }
 
+UNIT_TEST(recursive_call_lambda) {
+	CHECK(formula(variant("def fact_tail(n,a,b) factt(n,1) where factt = def(m,x) if(m > 0, x + m + recurse(m-1,x*m),x); fact_tail(5,0,0)")).execute() != variant(), "test failed");
+}
+
 UNIT_TEST(formula_slice) {
-	CHECK(formula("myList[2:4] where myList = [1,2,3,4,5,6]").execute() == formula("[3,4]").execute(), "test failed");
-	CHECK(formula("myList[0:2] where myList = [1,2,3,4,5,6]").execute() == formula("[1,2]").execute(), "test failed");
-	CHECK(formula("myList[1:4] where myList = [0,2,4,6,8,10,12,14]").execute() == formula("[2,4,6]").execute(), "test failed");
+	CHECK(formula(variant("myList[2:4] where myList = [1,2,3,4,5,6]")).execute() == formula(variant("[3,4]")).execute(), "test failed");
+	CHECK(formula(variant("myList[0:2] where myList = [1,2,3,4,5,6]")).execute() == formula(variant("[1,2]")).execute(), "test failed");
+	CHECK(formula(variant("myList[1:4] where myList = [0,2,4,6,8,10,12,14]")).execute() == formula(variant("[2,4,6]")).execute(), "test failed");
 }
 	
 	
 UNIT_TEST(formula_in) {
-	CHECK(formula("1 in [4,5,6]").execute() == variant(0), "test failed");
-	CHECK(formula("5 in [4,5,6]").execute() == variant(1), "test failed");
+	CHECK(formula(variant("1 in [4,5,6]")).execute() == variant(0), "test failed");
+	CHECK(formula(variant("5 in [4,5,6]")).execute() == variant(1), "test failed");
 }
 
 UNIT_TEST(formula_fn) {
 	function_symbol_table symbols;
-	CHECK(formula("def f(g) g(5) + 1; f(def(n) n*n)", &symbols).execute() == variant(26), "test failed");
+	CHECK(formula(variant("def f(g) g(5) + 1; def fn(n) n*n; f(fn)"), &symbols).execute() == variant(26), "test failed");
 }
 
 UNIT_TEST(array_index) {
-	formula f("map(range(6), 'n', elements[n]) = elements "
-			  "where elements = [5, 6, 7, 8, 9, 10]");
+	formula f(variant("map(range(6), 'n', elements[n]) = elements "
+			          "where elements = [5, 6, 7, 8, 9, 10]"));
 	CHECK(f.execute() == variant(1), "test failed");
 }
 
@@ -1728,7 +2097,7 @@ UNIT_TEST(dot_precedence) {
 	}
 	callable2->add("item", variant(&v));
 	callable->add("obj", variant(callable2));
-	formula f("obj.item[n].value where n = 2");
+	formula f(variant("obj.item[n].value where n = 2"));
 	const variant result = f.execute(*callable);
 	CHECK(result == variant(2), "test failed: " << result.to_debug_string());
 }
@@ -1737,27 +2106,134 @@ UNIT_TEST(short_circuit) {
 	map_formula_callable* callable = new map_formula_callable;
 	variant ref(callable);
 	callable->add("x", variant(0));
-	formula f("x and (5/x)");
+	formula f(variant("x and (5/x)"));
 	f.execute(*callable);
 }
 
 UNIT_TEST(formula_decimal) {
-	CHECK_EQ(formula("0.0005").execute().string_cast(), "0.000500");
-	CHECK_EQ(formula("0.005").execute().string_cast(), "0.005000");
-	CHECK_EQ(formula("0.05").execute().string_cast(), "0.050000");
-	CHECK_EQ(formula("0.5").execute().string_cast(), "0.500000");
-	CHECK_EQ(formula("8.5 + 0.5").execute().string_cast(), "9.000000");
-	CHECK_EQ(formula("4 * (-1.1)").execute().string_cast(), "-4.400000");
+	CHECK_EQ(formula(variant("0.0005")).execute().string_cast(), "0.0005");
+    CHECK_EQ(formula(variant("0.005")).execute().string_cast(), "0.005");
+	CHECK_EQ(formula(variant("0.05")).execute().string_cast(), "0.05");
+	CHECK_EQ(formula(variant("0.5")).execute().string_cast(), "0.5");
+	CHECK_EQ(formula(variant("8.5 + 0.5")).execute().string_cast(), "9.0");
+	CHECK_EQ(formula(variant("4 * (-1.1)")).execute().string_cast(), "-4.4");
+}
+
+UNIT_TEST(formula_quotes) {
+	CHECK_EQ(formula(variant("q((4+2())) + q^a^")).execute().string_cast(), "(4+2())a");
 }
 
 UNIT_TEST(map_to_maps_FAILS) {
-	CHECK_EQ(formula("{'a' -> ({'b' -> 2})}").execute().string_cast(), formula("{'a' -> {'b' -> 2}}").execute().string_cast());
+	CHECK_EQ(formula(variant("{'a' -> ({'b' -> 2})}")).execute().string_cast(), formula(variant("{'a' -> {'b' -> 2}}")).execute().string_cast());
+}
+
+UNIT_TEST(formula_test_recursion) {
+	function_symbol_table symbols;
+	formula f(variant(
+"def silly_add(a, c)"
+"base b <= 0: a "
+"recursive: silly_add(a+1, b-1) where b = c;"
+"silly_add(50, 5000)"), &symbols);
+
+	CHECK_EQ(f.execute().as_int(), 5050);
+}
+
+UNIT_TEST(formula_test_recurse_sort) {
+	formula f(variant(
+"def my_qsort(items) "
+"base size(items) <= 1: items "
+"recursive: my_qsort(filter(items, i, i < items[0])) +"
+"           filter(items, i, i = items[0]) +"
+"           my_qsort(filter(items, i, i > items[0]));"
+"my_qsort([4,10,2,9,1])"));
+	CHECK_EQ(f.execute(), formula(variant("[1,2,4,9,10]")).execute());
+}
+
+UNIT_TEST(formula_where_map) {
+	CHECK_EQ(formula(variant("{'a': a} where a = 4")).execute()["a"], variant(4));
+}
+
+UNIT_TEST(formula_function_default_args) {
+	CHECK_EQ(formula(variant("def f(x=5) x ; f() + f(1)")).execute(), variant(6));
+	CHECK_EQ(formula(variant("f(5) where f = def(x,y=2) x*y")).execute(), variant(10));
+}
+
+UNIT_TEST(formula_list_comprehension) {
+	std::vector<variant> result;
+	for(int n = 0; n != 4; ++n) {
+		result.push_back(variant(n));
+	}
+
+	CHECK_EQ(formula(variant("[x | x <- [0,1,2,3]]")).execute(), variant(&result));
+	CHECK_EQ(formula(variant("[x | x <- [0,1,2,3], x%2 = 1]")).execute(), formula(variant("[1,3]")).execute());
+}
+
+BENCHMARK(formula_list_comprehension_bench) {
+	formula f(variant("[x*x + 5 | x <- range(input)]"));
+	static map_formula_callable* callable = new map_formula_callable;
+	callable->add("input", variant(1000));
+	BENCHMARK_LOOP {
+		f.execute(*callable);
+	}
+}
+
+BENCHMARK(formula_map_bench) {
+	formula f(variant("map(range(input), value*value + 5)"));
+	static map_formula_callable* callable = new map_formula_callable;
+	callable->add("input", variant(1000));
+	BENCHMARK_LOOP {
+		f.execute(*callable);
+	}
+}
+
+BENCHMARK(formula_recurse_sort) {
+	formula f(variant(
+"def my_qsort(items) if(size(items) <= 1, items,"
+" my_qsort(filter(items, i, i < items[0])) +"
+"          filter(items, i, i = items[0]) +"
+" my_qsort(filter(items, i, i > items[0])));"
+"my_qsort(input)"));
+
+	std::vector<variant> input;
+	for(int n = 0; n != 100000; ++n) {
+		input.push_back(variant(n));
+	}
+
+	std::vector<variant> expected_result = input;
+	variant expected_result_v(&expected_result);
+
+	std::random_shuffle(input.begin(), input.end());
+	static map_formula_callable* callable = new map_formula_callable;
+	callable->add("input", variant(&input));
+	BENCHMARK_LOOP {
+		CHECK_EQ(f.execute(*callable), expected_result_v);
+	}
+}
+
+BENCHMARK(formula_recursion) {
+	formula f(variant(
+"def my_index(ls, item, n)"
+"base ls = []: -1 "
+"base ls[0] = item: n "
+"recursive: my_index(ls[1:], item, n+1);"
+"my_index(range(1000001), pos, 0)"));
+
+	formula f2(variant(
+"def silly_add(a, b)"
+"base b <= 0: a "
+"recursive: silly_add(a+1, b-1);"
+"silly_add(0, pos)"));
+	static map_formula_callable* callable = new map_formula_callable;
+	callable->add("pos", variant(100000));
+	BENCHMARK_LOOP {
+		CHECK_EQ(f.execute(*callable), variant(100000));
+	}
 }
 
 BENCHMARK(formula_if) {
 	static map_formula_callable* callable = new map_formula_callable;
 	callable->add("x", variant(1));
-	static formula f("if(x, 1, 0)");
+	static formula f(variant("if(x, 1, 0)"));
 	BENCHMARK_LOOP {
 		f.execute(*callable);
 	}
@@ -1766,7 +2242,7 @@ BENCHMARK(formula_if) {
 BENCHMARK(formula_add) {
 	static map_formula_callable* callable = new map_formula_callable;
 	callable->add("x", variant(1));
-	static formula f("x+1");
+	static formula f(variant("x+1"));
 	BENCHMARK_LOOP {
 		f.execute(*callable);
 	}

@@ -16,6 +16,7 @@
 #define FORMULA_FUNCTION_HPP_INCLUDED
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include <iostream>
@@ -31,10 +32,13 @@ namespace game_logic {
 class formula_expression;
 typedef boost::shared_ptr<formula_expression> expression_ptr;
 
+std::string pinpoint_location(variant v, std::string::const_iterator begin);
+std::string pinpoint_location(variant v, std::string::const_iterator begin,
+                                         std::string::const_iterator end);
+
 class formula_expression {
 public:
-	formula_expression() : name_(NULL) {}
-	explicit formula_expression(const char* name) : name_(name) {}
+	explicit formula_expression(const char* name=NULL);
 	virtual ~formula_expression() {}
 	virtual variant static_evaluate(const formula_callable& variables) const {
 		return evaluate(variables);
@@ -50,14 +54,14 @@ public:
 
 	variant evaluate(const formula_callable& variables) const {
 #if !TARGET_OS_IPHONE
-		call_stack_manager manager(str_.c_str());
+		call_stack_manager manager(this);
 #endif
 		return execute(variables);
 	}
 
 	variant evaluate_with_member(const formula_callable& variables, std::string& id) const {
 #if !TARGET_OS_IPHONE
-		call_stack_manager manager(str_.c_str());
+		call_stack_manager manager(this);
 #endif
 		return execute_member(variables, id);
 	}
@@ -74,14 +78,28 @@ public:
 		return NULL;
 	}
 
+	const char* name() const { return name_; }
 	void set_name(const char* name) { name_ = name; }
+
+	void copy_debug_info_from(const formula_expression& o);
+	virtual void set_debug_info(const variant& parent_formula,
+	                            std::string::const_iterator begin_str,
+	                            std::string::const_iterator end_str);
+	bool has_debug_info() const;
+	std::string debug_pinpoint_location() const;
+
 	void set_str(const std::string& str) { str_ = str; }
 	const std::string& str() const { return str_; }
+
+	variant parent_formula() const { return parent_formula_; }
 protected:
 	virtual variant execute_member(const formula_callable& variables, std::string& id) const;
 private:
 	virtual variant execute(const formula_callable& variables) const = 0;
 	const char* name_;
+
+	variant parent_formula_;
+	std::string::const_iterator begin_str_, end_str_;
 	std::string str_;
 };
 
@@ -93,12 +111,17 @@ public:
 	                    const args_list& args,
 	                    int min_args=-1, int max_args=-1);
 
+	virtual void set_debug_info(const variant& parent_formula,
+	                            std::string::const_iterator begin_str,
+	                            std::string::const_iterator end_str);
+
 protected:
 	const std::string& name() const { return name_; }
 	const args_list& args() const { return args_; }
 private:
 	std::string name_;
 	args_list args_;
+	int min_args_, max_args_;
 };
 
 class formula_function_expression : public function_expression {
@@ -107,7 +130,9 @@ public:
 	virtual ~formula_function_expression() {}
 
 	void set_formula(const_formula_ptr f) { formula_ = f; }
+	void set_has_closure(int base_slot) { has_closure_ = true; base_slot_ = base_slot; }
 private:
+	boost::intrusive_ptr<slot_formula_callable> calculate_args_callable(const formula_callable& variables) const;
 	variant execute(const formula_callable& variables) const;
 	const_formula_ptr formula_;
 	const_formula_ptr precondition_;
@@ -118,6 +143,10 @@ private:
 	//function. We try to reuse the same object every time the function is
 	//called rather than recreating it each time.
 	mutable boost::intrusive_ptr<slot_formula_callable> callable_;
+
+	mutable boost::scoped_ptr<variant> fed_result_;
+	bool has_closure_;
+	int base_slot_;
 };
 
 typedef boost::shared_ptr<function_expression> function_expression_ptr;
@@ -128,12 +157,17 @@ class formula_function {
 	const_formula_ptr formula_;
 	const_formula_ptr precondition_;
 	std::vector<std::string> args_;
+	std::vector<variant> default_args_;
 public:
 	formula_function() {}
-	formula_function(const std::string& name, const_formula_ptr formula, const_formula_ptr precondition, const std::vector<std::string>& args) : name_(name), formula_(formula), precondition_(precondition), args_(args)
+	formula_function(const std::string& name, const_formula_ptr formula, const_formula_ptr precondition, const std::vector<std::string>& args, const std::vector<variant>& default_args) : name_(name), formula_(formula), precondition_(precondition), args_(args), default_args_(default_args)
 	{}
 
 	formula_function_expression_ptr generate_function_expression(const std::vector<expression_ptr>& args) const;
+
+	const std::vector<std::string>& args() const { return args_; }
+	const std::vector<variant> default_args() const { return default_args_; }
+	const_formula_ptr get_formula() const { return formula_; }
 };	
 
 class function_symbol_table {
@@ -143,11 +177,12 @@ public:
 	function_symbol_table() : backup_(0) {}
 	virtual ~function_symbol_table() {}
 	void set_backup(const function_symbol_table* backup) { backup_ = backup; }
-	virtual void add_formula_function(const std::string& name, const_formula_ptr formula, const_formula_ptr precondition, const std::vector<std::string>& args);
+	virtual void add_formula_function(const std::string& name, const_formula_ptr formula, const_formula_ptr precondition, const std::vector<std::string>& args, const std::vector<variant>& default_args);
 	virtual expression_ptr create_function(const std::string& fn,
 					                       const std::vector<expression_ptr>& args,
 										   const formula_callable_definition* callable_def) const;
 	std::vector<std::string> get_function_names() const;
+	const formula_function* get_formula_function(const std::string& fn) const;
 };
 
 //a special symbol table which is used to facilitate recursive functions.
@@ -159,8 +194,9 @@ class recursive_function_symbol_table : public function_symbol_table {
 	formula_function stub_;
 	function_symbol_table* backup_;
 	mutable std::vector<formula_function_expression_ptr> expr_;
+	const formula_callable_definition* closure_definition_;
 public:
-	recursive_function_symbol_table(const std::string& fn, const std::vector<std::string>& args, function_symbol_table* backup);
+	recursive_function_symbol_table(const std::string& fn, const std::vector<std::string>& args, const std::vector<variant>& default_args, function_symbol_table* backup, const formula_callable_definition* closure_definition);
 	virtual expression_ptr create_function(const std::string& fn,
 					                       const std::vector<expression_ptr>& args,
 										   const formula_callable_definition* callable_def) const;
@@ -184,6 +220,10 @@ public:
 		v = v_;
 		return true;
 	}
+
+	variant is_literal() const {
+		return v_;
+	}
 private:
 	variant execute(const formula_callable& /*variables*/) const {
 		return v_;
@@ -191,7 +231,6 @@ private:
 	
 	variant v_;
 };
-
 
 }
 

@@ -4,8 +4,10 @@
 #include <sstream>
 #include <string>
 
+#include "formula.hpp"
 #include "preprocessor.hpp"
 #include "filesystem.hpp"
+#include "json_parser.hpp"
 #include "string_utils.hpp"
 
 std::string preprocess(const std::string& input){
@@ -17,9 +19,9 @@ std::string preprocess(const std::string& input){
 	while(i != input.end()){
 		if(*i == '#'){//enter a single-line comment
 			in_comment = true;}
-		if(*i == '\n' and in_comment){
+		if(*i == '\n' && in_comment){
 			in_comment = false;}
-		if(*i == '@' and not in_comment){
+		if(*i == '@' && !in_comment){
 			// process pre-processing directive here. See what comes after the '@' and do something appropriate
 			static const std::string IncludeString = "@include";
 			if(input.end() - i > IncludeString.size() && std::equal(IncludeString.begin(), IncludeString.end(), i)) {
@@ -32,7 +34,7 @@ std::string preprocess(const std::string& input){
 					if(quote == input.end()) {
 						std::cerr << "We didn't find a opening quote. Syntax error." << std::endl;
 					}
-					if(std::count_if(i, quote, util::isspace) != quote - i) {
+					if(std::count_if(i, quote, util::c_isspace) != quote - i) {
 					// # of whitespaces != number of intervening chars => something else was present.  Syntax Error. 
 						std::cerr << "# of whitespaces != number of intervening chars." << std::endl;
 					}
@@ -60,21 +62,57 @@ std::string preprocess(const std::string& input){
 	return output_string;
 }
 
-
-
-
-#ifdef BUILD_PREPROCESSOR_TOOL
-
-extern "C" int main(int argc, char** argv)
+variant preprocess_string_value(const std::string& input, const game_logic::formula_callable* callable)
 {
-
-
-	for(int i = 1; i < argc; ++i) {
-		std::ifstream file(argv[i], std::ios_base::binary);
-		std::stringstream ss;
-		ss << file.rdbuf();
-		std::cout << preprocess(ss.str());
+	if(input.empty() || input[0] != '@') {
+		return variant(input);
 	}
 
+	if(input.size() > 1 && input[1] == '@') {
+		//two @ at start of input just means a literal '@'.
+		return variant(std::string(input.begin()+1, input.end()));
+	}
+
+	if(input == "@base" || input == "@derive" || input == "@call" || input == "@flatten") {
+		return variant(input);
+	}
+
+	std::string::const_iterator i = std::find(input.begin(), input.end(), ' ');
+	const std::string directive(input.begin(), i);
+	if(directive == "@include") {
+		while(i != input.end() && *i == ' ') {
+			++i;
+		}
+
+		std::string fname(i, input.end());
+		std::vector<std::string> includes = util::split(fname, ' ');
+		if(includes.size() == 1) {
+			return json::parse_from_file(fname);
+		} else {
+			//treatment of a list of @includes is to make non-list items
+			//into singleton lists, and then concatenate all lists together.
+			std::vector<variant> res;
+			foreach(const std::string& inc, includes) {
+				variant v = json::parse_from_file(inc);
+				if(v.is_list()) {
+					foreach(const variant& item, v.as_list()) {
+						res.push_back(item);
+					}
+				} else {
+					res.push_back(v);
+				}
+			}
+
+			return variant(&res);
+		}
+	} else if(directive == "@eval") {
+		game_logic::formula f(variant(std::string(i, input.end())));
+		if(callable) {
+			return f.execute(*callable);
+		} else {
+			return f.execute();
+		}
+	} else {
+		throw preprocessor_error();
+	}
 }
-#endif

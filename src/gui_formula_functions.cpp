@@ -11,20 +11,20 @@
 #include "custom_object_functions.hpp"
 #include "custom_object_type.hpp"
 #include "draw_number.hpp"
+#include "foreach.hpp"
 #include "formula.hpp"
 #include "formula_callable_definition.hpp"
 #include "frame.hpp"
 #include "graphical_font.hpp"
 #include "gui_formula_functions.hpp"
 #include "iphone_controls.hpp"
+#include "json_parser.hpp"
 #include "level.hpp"
 #include "preferences.hpp"
 #include "raster.hpp"
 #include "string_utils.hpp"
 #include "unit_test.hpp"
-#include "wml_node.hpp"
-#include "wml_parser.hpp"
-#include "wml_utils.hpp"
+#include "variant_utils.hpp"
 
 using namespace game_logic;
 
@@ -239,6 +239,68 @@ private:
 	}
 };
 
+class draw_line_command : public gui_command {
+	decimal width_, x1_, y1_, x2_, y2_;
+public:
+	draw_line_command(decimal width, decimal x1, decimal y1, decimal x2, decimal y2) 
+		: width_(width), x1_(x1), y1_(y1), x2_(x2), y2_(y2)
+	{}
+
+	void execute(const gui_algorithm& algo) {
+		glDisable(GL_TEXTURE_2D);
+		glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+		glLineWidth(GLfloat(width_.as_float()));
+		glBegin(GL_LINES);
+		glVertex2f( GLfloat(x1_.as_float()), GLfloat(y1_.as_float()));
+		glVertex2f( GLfloat(x2_.as_float()), GLfloat(y2_.as_float()));
+		glEnd(); 		
+		glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+		glEnable(GL_TEXTURE_2D);
+	}
+};
+
+class draw_line_function : public function_expression {
+public:
+	explicit draw_line_function(const args_list& args)
+	  : function_expression("draw_line", args, 5, 5)
+	{}
+private:
+	variant execute(const formula_callable& variables) const {
+		return variant(new draw_line_command((args()[0]->evaluate(variables).as_decimal()),
+			(args()[1]->evaluate(variables).as_decimal()),
+			(args()[2]->evaluate(variables).as_decimal()),
+			(args()[3]->evaluate(variables).as_decimal()),
+			(args()[4]->evaluate(variables).as_decimal())
+		));
+	}
+};
+
+class draw_circle_command : public gui_command {
+	int x_, y_, r_;
+public:
+	draw_circle_command(int x, int y, int r) 
+		: x_(x), y_(y), r_(r)
+	{}
+
+	void execute(const gui_algorithm& algo) {
+		graphics::draw_circle(x_, y_, r_);
+	}
+};
+
+class draw_circle_function : public function_expression {
+public:
+	explicit draw_circle_function(const args_list& args)
+	  : function_expression("draw_circle", args, 3, 3)
+	{}
+private:
+	variant execute(const formula_callable& variables) const {
+		return variant(new draw_circle_command(args()[0]->evaluate(variables).as_int(),
+			(args()[1]->evaluate(variables).as_int()),
+			(args()[2]->evaluate(variables).as_int())
+		));
+	}
+};
+
 class gui_command_function_symbol_table : public function_symbol_table
 {
 	gui_algorithm* algo_;
@@ -261,6 +323,10 @@ public:
 			return expression_ptr(new draw_text_function(args));
 		} else if(fn == "color") {
 			return expression_ptr(new color_function(args));
+		} else if(fn == "draw_line") {
+			return expression_ptr(new draw_line_function(args));
+		} else if(fn == "draw_circle") {
+			return expression_ptr(new draw_circle_function(args));
 		}
 
 		return function_symbol_table::create_function(fn, args, callable_def);
@@ -320,28 +386,33 @@ private:
 
 } // namespace
 
-gui_algorithm::gui_algorithm(wml::const_node_ptr node)
+gui_algorithm::gui_algorithm(variant node)
 	  : lvl_(NULL),
-	  process_formula_(formula::create_optional_formula(node->attr("on_process"), &get_custom_object_functions_symbol_table(), &gui_algorithm_definition::instance())),
+	  loaded_(false),
+	  process_formula_(formula::create_optional_formula(node["on_process"], &get_custom_object_functions_symbol_table(), &gui_algorithm_definition::instance())),
 	  cycle_(0), object_(new custom_object("dummy_gui_object", 0, 0, true))
 {
 	gui_command_function_symbol_table symbols(this);
 
 	object_->add_ref();
-	std::vector<std::string> includes = util::split(node->attr("includes"));
+	std::vector<std::string> includes = util::split(node["includes"].as_string_default());
 	foreach(const std::string& inc, includes) {
 		includes_.push_back(get(inc));
 	}
 
 	set_object(object_);
 
-	FOREACH_WML_CHILD(frame_node, node, "animation") {
+	foreach(variant frame_node, node["animation"].as_list()) {
 		frame_ptr f(new frame(frame_node));
-		frames_[frame_node->attr("id")] = f;
+		frames_[frame_node["id"].as_string()] = f;
 	}
 
-	draw_formula_ = formula::create_optional_formula(node->attr("on_draw"), &symbols, &gui_algorithm_definition::instance());
+	if(node.has_key("buttons")) {
+		buttons_ = node["buttons"];
+	}
 
+	draw_formula_ = formula::create_optional_formula(node["on_draw"], &symbols, &gui_algorithm_definition::instance());
+	load_formula_ = formula::create_optional_formula(node["on_load"], &get_custom_object_functions_symbol_table(), &gui_algorithm_definition::instance());
 }
 
 gui_algorithm::~gui_algorithm()
@@ -367,11 +438,89 @@ void gui_algorithm::set_object(boost::intrusive_ptr<custom_object> obj) {
 
 void gui_algorithm::new_level() {
 	cycle_ = 0;
+	loaded_ = false;
 	set_object(boost::intrusive_ptr<custom_object>(new custom_object("dummy_gui_object", 0, 0, true)));
+	if(!buttons_.is_null()) {
+		object_->mutate_value("buttons", buttons_);
+	}
+}
+
+void gui_algorithm::load(level& lvl) {
+	if(load_formula_) {
+		object_->set_level(lvl);
+		variant result = load_formula_->execute(*this);
+		object_->execute_command(result);
+
+		if(!object_->vars()->has_key("buttons")) {
+			return;
+		}
+		button_formulas_.clear();
+		foreach(const variant v, object_->vars()->query_value("buttons").as_list()) {
+			std::string id = v["id"].as_string();
+			variant r = game_logic::formula(v["hit_rect"]).execute();
+			button_hit_rects_[id] = rect(r[0].as_int(), r[1].as_int(), r[2].as_int(), r[3].as_int());
+			//std::cerr << "ID: " << id << ", hit_rect " << button_hit_rects_[id] << std::endl;
+
+			if(v.has_key("on_mouse_down")) {
+				button_formulas_[id].insert(
+					std::make_pair(SDL_MOUSEBUTTONDOWN, 
+					formula::create_optional_formula(v["on_mouse_down"], &get_custom_object_functions_symbol_table(), &gui_algorithm_definition::instance())));
+			}
+			if(v.has_key("on_mouse_up")) {
+				button_formulas_[id].insert(
+					std::make_pair(SDL_MOUSEBUTTONUP, 
+					formula::create_optional_formula(v["on_mouse_up"], &get_custom_object_functions_symbol_table(), &gui_algorithm_definition::instance())));
+			}
+			if(v.has_key("on_mouse_move")) {
+				button_formulas_[id].insert(
+					std::make_pair(SDL_MOUSEMOTION, 
+					formula::create_optional_formula(v["on_mouse_move"], &get_custom_object_functions_symbol_table(), &gui_algorithm_definition::instance())));
+			}
+		}
+ 	}
+}
+
+bool gui_algorithm::gui_event(level& lvl, const SDL_Event &event) {
+	if(event.type == SDL_MOUSEBUTTONDOWN 
+		|| event.type == SDL_MOUSEBUTTONUP 
+		|| event.type == SDL_MOUSEMOTION) {
+		int x = event.type == SDL_MOUSEMOTION ? event.motion.x : event.button.x;
+		int y = event.type == SDL_MOUSEMOTION ? event.motion.y : event.button.y;
+		int i = event.type == SDL_MOUSEMOTION ? event.motion.which : event.button.which;
+		map_formula_callable_ptr callable(new map_formula_callable(this));
+		callable->add("mouse_x", variant(x));
+		callable->add("mouse_y", variant(y));
+		callable->add("mouse_index", variant(i));
+		if(event.type != SDL_MOUSEMOTION) {
+			callable->add("mouse_button", variant(event.button.button));
+		}
+		const point mouse_pos(x, y);
+		foreach(variant b, buttons_.as_list()) {
+			std::string id = b["id"].as_string();
+			callable->add("in_hitrect", variant(point_in_rect(mouse_pos, button_hit_rects_[id])));
+			callable->add("button_id", b["id"]);
+			//std::cerr << "mouse event hit in " << b["id"].as_string() << std::endl;
+			std::map<const int, game_logic::formula_ptr>::iterator it = button_formulas_[id].find(event.type);
+			if(it != button_formulas_[id].end()) {
+				object_->set_level(lvl);
+				object_->reset_mouse_event();
+				variant result = it->second->execute(*callable);
+				object_->execute_command(result);
+				if(object_->mouse_event_swallowed()) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 void gui_algorithm::process(level& lvl) {
 	lvl_ = &lvl;
+	if(!loaded_) {
+		loaded_ = true;
+		load(lvl);
+	}
 	++cycle_;
 	if((cycle_%2) == 0 && process_formula_) {
 		object_->set_level(lvl);
@@ -424,7 +573,7 @@ void gui_algorithm::execute_command(variant v) {
 
 gui_algorithm_ptr gui_algorithm::create(const std::string& key) {
 	static const std::string path = preferences::load_compiled() ? "data/compiled/gui/" : "data/gui/";
-	return gui_algorithm_ptr(new gui_algorithm(wml::parse_wml_from_file(path + key + ".cfg")));
+	return gui_algorithm_ptr(new gui_algorithm(json::parse_from_file(path + key + ".cfg")));
 }
 
 void gui_algorithm::draw_animation(const std::string& object_name, const std::string& anim, int x, int y, int cycle) const {

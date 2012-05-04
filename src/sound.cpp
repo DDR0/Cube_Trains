@@ -8,13 +8,11 @@
 #include <boost/shared_ptr.hpp>
 
 #include "foreach.hpp"
+#include "module.hpp"
 #include "preferences.hpp"
 #include "thread.hpp"
 #include "filesystem.hpp"
-#include "SDL.h"
-#if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
-#include "SDL_mixer.h"
-#endif
+#include "graphics.hpp"
 
 #include "sound.hpp"
 
@@ -22,12 +20,22 @@
 #include "iphone_sound.h"
 #endif
 
+#include "variant_utils.hpp"
+
 namespace sound {
 
 namespace {
 
+struct MusicInfo {
+	MusicInfo() : volume(1.0) {}
+	float volume;
+};
+
+std::map<std::string, MusicInfo> music_index;
+
 float sfx_volume = 1.0;
-float recorded_music_volume = 1.0;
+float user_music_volume = 1.0;
+float engine_music_volume = 1.0;
 const int SampleRate = 44100;
 // number of allocated channels, 
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
@@ -82,6 +90,7 @@ struct sound_playing {
 	std::string file;
 	const void* object;
 	int	loops;		//not strictly boolean.  -1=true, 0=false
+	float volume;
 };
 
 std::vector<sound_playing> channels_to_sounds_playing, queued_sounds;
@@ -124,7 +133,11 @@ class sound
 		SDL_AudioSpec spec; /* the audio format of the .wav file */
 		SDL_AudioCVT cvt; /* used to convert .wav to output format when formats differ */
 		Uint8 *tmp_buffer;
-		if (SDL_LoadWAV(file.c_str(), &spec, &tmp_buffer, &length) == NULL)
+#if defined(__ANDROID__)
+		if(SDL_LoadWAV_RW(sys::read_sdl_rw_from_asset(module::map_file(file).c_str(), 1, &spec, &tmp_buffer, &length) == NULL)
+#else
+		if (SDL_LoadWAV(module::map_file(file).c_str(), &spec, &tmp_buffer, &length) == NULL)
+#endif
 		{
 			std::cerr << "Could not load sound: " << file << "\n";
 			return; //should maybe die
@@ -273,8 +286,11 @@ bool sound_init = false;
 void thread_load(const std::string& file)
 {
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
-	Mix_Chunk* chunk = Mix_LoadWAV(("sounds/" + file).c_str());
-
+#if defined(__ANDROID__)
+	Mix_Chunk* chunk = Mix_LoadWAV_RW(sys::read_sdl_rw_from_asset(module::map_file("sounds/" + file).c_str()),1);
+#else
+	Mix_Chunk* chunk = Mix_LoadWAV(module::map_file("sounds/" + file).c_str());
+#endif
 	{
 		threading::lock l(cache_mutex);
 		threaded_cache[file] = chunk;
@@ -347,7 +363,7 @@ manager::manager()
     }
 #endif
 
-	set_music_volume(recorded_music_volume);
+	set_music_volume(user_music_volume);
 }
 
 manager::~manager()
@@ -367,6 +383,14 @@ manager::~manager()
 #endif
 }
 
+void init_music(variant node)
+{
+	foreach(variant music_node, node["music"].as_list()) {
+		const std::string name = music_node["name"].as_string();
+		music_index[name].volume = music_node["volume"].as_decimal(decimal(1.0)).as_float();
+	}
+}
+
 bool ok() { return sound_ok; }
 bool muted() { return mute_; }
 
@@ -374,7 +398,7 @@ void mute (bool flag)
 {
 	mute_ = flag;
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
-	Mix_VolumeMusic(MIX_MAX_VOLUME*(!flag));
+	Mix_VolumeMusic(engine_music_volume*MIX_MAX_VOLUME*(!flag));
 #endif
 }
 
@@ -388,13 +412,17 @@ void preload(const std::string& file)
 		return;
 	}
 
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+	boost::shared_ptr<threading::thread> t(new threading::thread("sounds", boost::bind(thread_load, file)));
+#else
 	boost::shared_ptr<threading::thread> t(new threading::thread(boost::bind(thread_load, file)));
+#endif
 	loading_threads[file] = t;
 }
 
 namespace {
 
-int play_internal(const std::string& file, int loops, const void* object)
+int play_internal(const std::string& file, int loops, const void* object, float volume)
 {
 	if(!sound_ok) {
 		return -1;
@@ -406,6 +434,7 @@ int play_internal(const std::string& file, int loops, const void* object)
 		queued_sounds.back().file = file;
 		queued_sounds.back().loops = loops;
 		queued_sounds.back().object = object;
+		queued_sounds.back().volume = volume;
 		
 		return -1;
 	}
@@ -433,7 +462,7 @@ int play_internal(const std::string& file, int loops, const void* object)
 			channels_to_sounds_playing.resize(result + 1);
 		}
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
-		Mix_Volume(result, sfx_volume*MIX_MAX_VOLUME); //start sound at full volume
+		Mix_Volume(result, volume*sfx_volume*MIX_MAX_VOLUME); //start sound at full volume
 #endif
 
 		channels_to_sounds_playing[result].file = file;
@@ -464,18 +493,18 @@ void process()
 		std::vector<sound_playing> sounds;
 		sounds.swap(queued_sounds);
 		foreach(const sound_playing& sfx, sounds) {
-			play_internal(sfx.file, sfx.loops, sfx.object);
+			play_internal(sfx.file, sfx.loops, sfx.object, sfx.volume);
 		}
 	}
 }
 
-void play(const std::string& file, const void* object)
+void play(const std::string& file, const void* object, float volume)
 {
 	if(preferences::no_sound() || mute_) {
 		return;
 	}
 
-	play_internal(file, 0, object);
+	play_internal(file, 0, object, volume);
 }
 
 void stop_sound(const std::string& file, const void* object)
@@ -536,14 +565,14 @@ void stop_looped_sounds(const void* object)
 	}
 }
 	
-int play_looped(const std::string& file, const void* object)
+int play_looped(const std::string& file, const void* object, float volume)
 {
 	if(preferences::no_sound() || mute_) {
 		return -1;
 	}
 
 
-	const int result = play_internal(file, -1, object);
+	const int result = play_internal(file, -1, object, volume);
 	std::cerr << "PLAY: " << object << " " << file << " -> " << result << "\n";
 	return result;
 }
@@ -581,24 +610,45 @@ void set_sound_volume(float volume)
 
 float get_music_volume()
 {
+	return user_music_volume;
+}
+
+namespace {
+void update_music_volume()
+{
+	if(sound_init) {
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
-	return (float)Mix_VolumeMusic(-1)/MIX_MAX_VOLUME;
+		Mix_VolumeMusic(user_music_volume*engine_music_volume*MIX_MAX_VOLUME);
 #else
-	return iphone_get_music_volume();
+		iphone_set_music_volume(user_music_volume*engine_music_volume);
 #endif
+	}
+}
 }
 
 void set_music_volume(float volume)
 {
-	recorded_music_volume = volume;
+	user_music_volume = volume;
+	update_music_volume();
+}
 
-	if(sound_init) {
-#if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
-		Mix_VolumeMusic(volume*MIX_MAX_VOLUME);
-#else
-		iphone_set_music_volume(volume);
-#endif
-	}
+void set_engine_music_volume(float volume)
+{
+	engine_music_volume = volume;
+	update_music_volume();
+}
+
+float get_engine_music_volume()
+{
+	return engine_music_volume;
+}
+
+namespace {
+std::map<std::string,std::string> get_music_paths() {
+	std::map<std::string,std::string> res;
+	module::get_unique_filenames_under_dir("music/", &res);
+	return res;
+}
 }
 
 void play_music(const std::string& file)
@@ -612,22 +662,32 @@ void play_music(const std::string& file)
 	}
 
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
+
+	static const std::map<std::string, std::string> music_paths = get_music_paths();
+	if(!music_paths.count(file)) {
+		return;
+	}
+
+	const std::string& path = music_paths.find(file)->second;
+
 	if(current_mix_music) {
 		next_music() = file;
 		Mix_FadeOutMusic(500);
 		return;
 	}
 
-	if(file.empty()) {
+	current_music_name() = file;
+#if defined(__ANDROID__)
+	current_mix_music = Mix_LoadMUS_RW(sys::read_sdl_rw_from_asset(path.c_str()));
+#else
+	current_mix_music = Mix_LoadMUS(path.c_str());
+#endif
+	if(!current_mix_music) {
+		std::cerr << "Mix_LoadMUS ERROR loading " << path << ": " << Mix_GetError() << "\n";
 		return;
 	}
 
-	current_music_name() = file;
-	current_mix_music = Mix_LoadMUS(("music/" + file).c_str());
-	if(!current_mix_music) {
-		std::cerr << "Mix_LoadMUS ERROR loading " << file << ": " << Mix_GetError() << "\n";
-		return;
-	}
+	set_engine_music_volume(music_index[file].volume);
 
 	Mix_FadeInMusic(current_mix_music, -1, 500);
 #else
@@ -646,6 +706,7 @@ void play_music(const std::string& file)
 	std::string aac_file = file;
 	aac_file.replace(aac_file.length()-3, aac_file.length(), "m4a");
 	if (!sys::file_exists("music_aac/" + aac_file)) return;
+	set_engine_music_volume(music_index[file].volume);
 	iphone_play_music(("music_aac/" + aac_file).c_str(), -1);
 	iphone_fade_in_music(350);
 	playing_music = true;
@@ -669,6 +730,13 @@ void play_music_interrupt(const std::string& file)
 
 #if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_IPHONE
 
+	static const std::map<std::string, std::string> music_paths = get_music_paths();
+	if(!music_paths.count(file)) {
+		return;
+	}
+
+	const std::string& path = music_paths.find(file)->second;
+
 	//note that calling HaltMusic will result in on_music_finished being
 	//called, which releases the current_music pointer.
 	Mix_HaltMusic();
@@ -676,7 +744,12 @@ void play_music_interrupt(const std::string& file)
 		return;
 	}
 
-	current_mix_music = Mix_LoadMUS(("music/" + file).c_str());
+#if defined(__ANDROID__)
+	current_mix_music = Mix_LoadMUS_RW(sys::read_sdl_rw_from_asset(path.c_str()));
+#else
+	current_mix_music = Mix_LoadMUS(path.c_str());
+#endif
+
 	if(!current_mix_music) {
 		std::cerr << "Mix_LoadMUS ERROR loading " << file << ": " << Mix_GetError() << "\n";
 		return;

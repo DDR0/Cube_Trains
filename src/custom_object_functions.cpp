@@ -19,14 +19,15 @@
 #include "filesystem.hpp"
 #include "formatter.hpp"
 #include "formula_callable_definition.hpp"
+#include "formula_function_registry.hpp"
 #include "formula_profiler.hpp"
 #include "i18n.hpp"
+#include "json_parser.hpp"
 #include "level.hpp"
 #include "level_runner.hpp"
 #include "object_events.hpp"
 #include "pause_game_dialog.hpp"
 #include "player_info.hpp"
-#include "powerup.hpp"
 #include "raster.hpp"
 #include "texture.hpp"
 #include "message_dialog.hpp"
@@ -35,6 +36,7 @@
 #include "preferences.hpp"
 #include "random.hpp"
 #include "raster_distortion.hpp"
+#include "rectangle_rotator.hpp"
 #include "sound.hpp"
 #include "speech_dialog.hpp"
 #include "stats.hpp"
@@ -42,81 +44,38 @@
 #include "text_entry_widget.hpp"
 #include "thread.hpp"
 #include "unit_test.hpp"
-#include "wml_formula_adapter.hpp"
-#include "wml_parser.hpp"
-#include "wml_node.hpp"
-#include "wml_schema.hpp"
-#include "wml_utils.hpp"
-#include "wml_writer.hpp"
 #include "preferences.hpp"
 #include "settings_dialog.hpp"
+#include "module.hpp"
 
 using namespace game_logic;
 
 namespace {
 
-class function_creator {
-public:
-	virtual ~function_creator() {}
-	virtual function_expression* create(const function_expression::args_list& args) const = 0;
-};
-
-template<typename T>
-class specific_function_creator : public function_creator {
-public:
-	virtual ~specific_function_creator() {}
-	virtual function_expression* create(const function_expression::args_list& args) const {
-		return new T(args);
-	}
-};
-
-std::map<std::string, function_creator*>& function_creators() {
-	static std::map<std::string, function_creator*> creators;
-	return creators;
-}
-
-int register_function_creator(const std::string& id, function_creator* creator) {
-	function_creators()[id] = creator;
-	return function_creators().size();
-}
-
-std::vector<std::string>& function_helpstrings() {
-	static std::vector<std::string> instance;
-	return instance;
-}
-
-int register_function_helpstring(const std::string& str) {
-	function_helpstrings().push_back(str);
-	return function_helpstrings().size();
-}
-
-#define FUNCTION_DEF(name, min_args, max_args, helpstring) \
-const int name##_dummy_help_var = register_function_helpstring(helpstring); \
-class name##_function : public function_expression { \
-public: \
-	explicit name##_function(const args_list& args) \
-	  : function_expression(#name, args, min_args, max_args) {} \
-private: \
-	variant execute(const formula_callable& variables) const {
-
-#define END_FUNCTION_DEF(name) } }; const int name##_dummy_var = register_function_creator(#name, new specific_function_creator<name##_function>());
+const std::string FunctionModule = "custom_object";
 
 FUNCTION_DEF(time, 0, 0, "time() -> timestamp: returns the current real time")
 	rng::generate(); //this is to make the engine optimisation leave this function alone.
 	time_t t1;
 	time(&t1);
-	return variant(t1);
+	return variant(static_cast<int>(t1));
 END_FUNCTION_DEF(time)
+
+class report_command : public entity_command_callable
+{
+	variant v_;
+public:
+	explicit report_command(variant v) : v_(v)
+	{}
+
+	virtual void execute(level& lvl, entity& ob) const {
+		stats::record(v_);
+	}
+};
 	
-FUNCTION_DEF(report_, 4, 4, "report() -> boolean: Write a key and a value into [custom] in the stats.")
-		level* lvl = args()[0]->evaluate(variables).convert_to<level>();
-		entity_ptr obj = args()[1]->evaluate(variables).convert_to<entity>();
-		const std::string key = args()[2]->evaluate(variables).as_string();
-		const std::string value = args()[3]->evaluate(variables).as_string();
-		//std::cerr << "Reporting '" << key << "' at '" << value << "' in " << lvl->id() << ".\n";
-		stats::record_event(lvl -> id(), stats::record_ptr(new stats::custom_record(key, value, obj->midpoint())));
-		return variant(true);
-END_FUNCTION_DEF(report_)
+FUNCTION_DEF(report, 1, 1, "report(): Write a key and a value into [custom] in the stats.")
+		return variant(new report_command(args()[0]->evaluate(variables)));
+END_FUNCTION_DEF(report)
 
 namespace {
 int show_simple_option_dialog(level& lvl, const std::string& text, const std::vector<std::string>& options)
@@ -138,12 +97,15 @@ int show_simple_option_dialog(level& lvl, const std::string& text, const std::ve
 			}
 		}
 		
-		if(d->process()) {
+		if(d->process() || d->detect_joystick_press()) {
 			done = true;
 		}
 
 		draw_scene(lvl, last_draw_position(), &lvl.player()->get_entity());
 		SDL_GL_SwapBuffers();
+#if defined(__ANDROID__)
+		graphics::reset_opengl_state();
+#endif
 		SDL_Delay(20);
 	}
 
@@ -166,9 +128,12 @@ public:
 			const std::string path = std::string(preferences::user_data_path()) + "/" + fname;
 			if(sys::file_exists(path)) {
 				has_options = true;
-				const wml::node_ptr doc = wml::parse_wml_from_file(path);
-				if(doc) {
-					options.back() = formatter() << "Slot " << (nslot+1) << ": " << doc->attr("title");
+				try {
+					const variant doc = json::parse_from_file(path);
+					if(doc.is_null() == false) {
+						options.back() = formatter() << "Slot " << (nslot+1) << ": " << doc["title"].as_string();
+					}
+				} catch(json::parse_error&) {
 				}
 			}
 
@@ -177,7 +142,7 @@ public:
 
 		if(has_options) {
 
-			const int noption = show_simple_option_dialog(lvl, "Select save slot to use.", options);
+			const int noption = show_simple_option_dialog(lvl, _("Select save slot to use."), options);
 			if(noption != -1) {
 				std::cerr << "setting save slot: " << noption << " -> " << SaveFiles[noption] << "\n";
 				preferences::set_save_slot(SaveFiles[noption]);
@@ -201,12 +166,12 @@ public:
 	virtual void execute(level& lvl, entity& ob) const {
 		lvl.player()->get_entity().save_game();
 		if(persistent_) {
-			wml::node_ptr node = lvl.write();
+			variant node = lvl.write();
 			if(sound::current_music().empty() == false) {
-				node->set_attr("music", sound::current_music());
+				node = node.add_attr(variant("music"), variant(sound::current_music()));
 			}
 
-			sys::write_file(preferences::save_file_path(), wml::output(node));
+			sys::write_file(preferences::save_file_path(), node.write_json());
 		}
 	}
 };
@@ -220,55 +185,62 @@ FUNCTION_DEF(save_game, 0, 0, "save_game(): saves the current game state")
 END_FUNCTION_DEF(save_game)
 
 class load_game_command : public entity_command_callable
-	{
-	public:
-		virtual void execute(level& lvl, entity& ob) const {
-			std::vector<std::string> save_options;
-			save_options.push_back("save.cfg");
+{
+	std::string transition_;
+public:
+	explicit load_game_command(const std::string& transition) : transition_(transition) {}
+	virtual void execute(level& lvl, entity& ob) const {
+		std::vector<std::string> save_options;
+		save_options.push_back("save.cfg");
 
-			for(int n = 2; n <= 4; ++n) {
-				std::string fname = formatter() << "save" << n << ".cfg";
-				if(sys::file_exists(std::string(preferences::user_data_path()) + "/" + fname)) {
-					save_options.push_back(fname);
-				}
+		for(int n = 2; n <= 4; ++n) {
+			std::string fname = formatter() << "save" << n << ".cfg";
+			if(sys::file_exists(std::string(preferences::user_data_path()) + "/" + fname)) {
+				save_options.push_back(fname);
 			}
-
-			int noption = 0;
-
-			if(save_options.size() > 1) {
-				int nslot = 1;
-				std::vector<std::string> option_descriptions;
-				foreach(const std::string& option, save_options) {
-					const std::string fname = std::string(preferences::user_data_path()) + "/" + option;
-					const wml::node_ptr doc = wml::parse_wml_from_file(fname);
-					if(doc) {
-						option_descriptions.push_back(formatter() << "Slot " << nslot << ": " << doc->attr("title"));
-					} else {
-						option_descriptions.push_back(formatter() << "Slot " << nslot << ": Frogatto");
-					}
-
-					++nslot;
-				}
-
-				noption = show_simple_option_dialog(lvl, "Select save slot to load.", option_descriptions);
-
-				if(noption == -1) {
-					return;
-				}
-
-				preferences::set_save_slot(save_options[noption]);
-			}
-
-			level::portal p;
-			p.level_dest = save_options[noption];
-			p.dest_starting_pos = true;
-			p.saved_game = true;
-			lvl.force_enter_portal(p);
 		}
-	};
 
-FUNCTION_DEF(load_game, 0, 0, "load_game(): loads the saved game")
-	return variant(new load_game_command());
+		int noption = 0;
+
+		if(save_options.size() > 1) {
+			int nslot = 1;
+			std::vector<std::string> option_descriptions;
+			foreach(const std::string& option, save_options) {
+				const std::string fname = std::string(preferences::user_data_path()) + "/" + option;
+				try {
+					const variant doc = json::parse_from_file(fname);
+					option_descriptions.push_back(formatter() << "Slot " << nslot << ": " << doc["title"].as_string());
+				} catch(json::parse_error&) {
+					option_descriptions.push_back(formatter() << "Slot " << nslot << ": Frogatto");
+				}
+
+				++nslot;
+			}
+
+			noption = show_simple_option_dialog(lvl, _("Select save slot to load."), option_descriptions);
+
+			if(noption == -1) {
+				return;
+			}
+
+			preferences::set_save_slot(save_options[noption]);
+		}
+
+		level::portal p;
+		p.level_dest = save_options[noption];
+		p.dest_starting_pos = true;
+		p.saved_game = true; 
+		p.transition = transition_;
+		lvl.force_enter_portal(p);
+	}
+};
+
+FUNCTION_DEF(load_game, 0, 1, "load_game(transition): loads the saved game. If transition (a string) is given, it will use that type of transition.")
+	std::string transition;
+	if(args().size() >= 1) {
+		transition = args()[0]->evaluate(variables).as_string();
+	}
+	return variant(new load_game_command(transition));
 END_FUNCTION_DEF(load_game)
 
 FUNCTION_DEF(can_load_game, 0, 0, "can_load_game(): returns true if there is a saved game available to load")
@@ -320,15 +292,15 @@ END_FUNCTION_DEF(music_onetime)
 class sound_command : public entity_command_callable
 {
 public:
-	explicit sound_command(const std::string& name, const bool loops)
-	  : names_(util::split(name)), loops_(loops)
+	explicit sound_command(const std::string& name, const bool loops, float volume)
+	  : names_(util::split(name)), loops_(loops), volume_(volume)
 	{}
 	virtual void execute(level& lvl, entity& ob) const {
 		if(loops_){
 			if (names_.empty() == false){
 				int randomNum = rand()%names_.size();  //like a 1d-size die
 				if(names_[randomNum].empty() == false) {
-					sound::play_looped(names_[randomNum], &ob);
+					sound::play_looped(names_[randomNum], &ob, volume_);
 				}
 			}
 			
@@ -337,7 +309,7 @@ public:
 			if (names_.empty() == false){
 				int randomNum = rand()%names_.size();  //like a 1d-size die
 				if(names_[randomNum].empty() == false) {
-					sound::play(names_[randomNum], &ob);
+					sound::play(names_[randomNum], &ob, volume_);
 				}
 			}
 		}
@@ -345,18 +317,21 @@ public:
 private:
 	std::vector<std::string> names_;
 	bool loops_;
+	float volume_;
 };
 
-FUNCTION_DEF(sound, 1, 1, "sound(string id): plays the sound file given by 'id'")
+FUNCTION_DEF(sound, 1, 2, "sound(string id, decimal volume): plays the sound file given by 'id'")
 	return variant(new sound_command(
 									 args()[0]->evaluate(variables).as_string(),
-									 false));
+									 false,
+									 args().size() > 1 ? args()[1]->evaluate(variables).as_decimal().as_float() : 1.0));
 END_FUNCTION_DEF(sound)
 
-FUNCTION_DEF(sound_loop, 1, 1, "sound_loop(string id): plays the sound file given by 'id' in a loop")
+FUNCTION_DEF(sound_loop, 1, 2, "sound_loop(string id, decimal volume): plays the sound file given by 'id' in a loop")
 	return variant(new sound_command(
 									 args()[0]->evaluate(variables).as_string(),
-									 true));
+									 true,
+									 args().size() > 1 ? args()[1]->evaluate(variables).as_decimal().as_float() : 1.0));
 END_FUNCTION_DEF(sound_loop)
 
 
@@ -533,72 +508,81 @@ END_FUNCTION_DEF(execute)
 class spawn_command : public entity_command_callable
 {
 public:
-	spawn_command(const std::string& type, int x, int y, bool face_right, variant instantiation_commands, bool player)
-	  : type_(type), x_(x), y_(y), face_right_(face_right), instantiation_commands_(instantiation_commands), player_(player)
+	spawn_command(boost::intrusive_ptr<custom_object> obj, variant instantiation_commands)
+	  : obj_(obj), instantiation_commands_(instantiation_commands)
 	{}
 	virtual void execute(level& lvl, entity& ob) const {
-		custom_object* obj = new custom_object(type_, x_, y_, face_right_);
-		if(player_) {
-			//make a playable version of this object
-			custom_object* player = new playable_custom_object(*obj);
-			delete obj;
-			obj = player;
-		}
+		obj_->set_level(lvl);
+		obj_->set_spawned_by(ob.label());
 
-		obj->set_level(lvl);
-		entity_ptr e = obj;
-		
-		//spawn with the spawned object's midpoint (rather than its upper-left corner) at x_, y_.
-		//This means objects are centered on the point they're spawned on, which is a lot more intuitive for scripting.
-		e->set_pos(e->x() - e->current_frame().width() / 2 , e->y() - e->current_frame().height() / 2);
-
-		if(!place_entity_in_level_with_large_displacement(lvl, *obj)) {
+		if(!place_entity_in_level_with_large_displacement(lvl, *obj_)) {
 			return;
 		}
 
-		lvl.add_character(e);
+		lvl.add_character(obj_);
 
-		e->execute_command(instantiation_commands_);
+		obj_->execute_command(instantiation_commands_);
 
 		//send an event to the parent to let them know they've spawned a child,
 		//and let them record the child's details.
 		game_logic::map_formula_callable* spawn_callable(new game_logic::map_formula_callable);
 		variant holder(spawn_callable);
 		spawn_callable->add("spawner", variant(&ob));
-		spawn_callable->add("child", variant(obj));
+		spawn_callable->add("child", variant(obj_.get()));
 		ob.handle_event("child_spawned", spawn_callable);
-		obj->handle_event("spawned", spawn_callable);
+		obj_->handle_event("spawned", spawn_callable);
 
-		if(entity_collides(lvl, *e, MOVE_NONE)) {
-			lvl.remove_character(e);
+		if(entity_collides(lvl, *obj_, MOVE_NONE)) {
+			lvl.remove_character(obj_);
 		}
 	}
 private:
-	std::string type_;
-	int x_, y_;
+	boost::intrusive_ptr<custom_object> obj_;
 	variant instantiation_commands_;
-	bool face_right_;
-	bool player_;
 };
 
 FUNCTION_DEF(spawn, 4, 5, "spawn(string type_id, int midpoint_x, int midpoint_y, int facing, (optional) list of commands cmd): will create a new object of type given by type_id with the given midpoint and facing. Immediately after creation the object will have any commands given by cmd executed on it. The child object will have the spawned event sent to it, and the parent object will have the child_spawned event sent to it.")
-	return variant(new spawn_command(
-	                 args()[0]->evaluate(variables).as_string(),
-	                 args()[1]->evaluate(variables).as_int(),
-	                 args()[2]->evaluate(variables).as_int(),
-	                 args()[3]->evaluate(variables).as_int() > 0,
-					 args().size() > 4 ? args()[4]->evaluate(variables) : variant(),
-					 false));
+
+	formula::fail_if_static_context();
+
+	const std::string type = EVAL_ARG(0).as_string();
+	const int x = EVAL_ARG(1).as_int();
+	const int y = EVAL_ARG(2).as_int();
+	const bool facing = EVAL_ARG(3).as_int() > 0;
+	boost::intrusive_ptr<custom_object> obj(new custom_object(type, x, y, facing));
+	obj->set_pos(obj->x() - obj->current_frame().width() / 2 , obj->y() - obj->current_frame().height() / 2);
+
+	variant commands;
+	if(args().size() > 4) {
+		map_formula_callable_ptr callable = new map_formula_callable(&variables);
+		callable->add("child", variant(obj.get()));
+		commands = args()[4]->evaluate(*callable);
+	}
+
+	return variant(new spawn_command(obj, commands));
 END_FUNCTION_DEF(spawn)
 
 FUNCTION_DEF(spawn_player, 4, 5, "spawn_player(string type_id, int midpoint_x, int midpoint_y, int facing, (optional) list of commands cmd): identical to spawn except that the new object is playable.")
-	return variant(new spawn_command(
-	                 args()[0]->evaluate(variables).as_string(),
-	                 args()[1]->evaluate(variables).as_int(),
-	                 args()[2]->evaluate(variables).as_int(),
-	                 args()[3]->evaluate(variables).as_int() > 0,
-					 args().size() > 4 ? args()[4]->evaluate(variables) : variant(),
-					 true));
+
+	formula::fail_if_static_context();
+
+	const std::string type = EVAL_ARG(0).as_string();
+	const int x = EVAL_ARG(1).as_int();
+	const int y = EVAL_ARG(2).as_int();
+	const bool facing = EVAL_ARG(3).as_int() > 0;
+	boost::intrusive_ptr<custom_object> obj(new custom_object(type, x, y, facing));
+	obj.reset(new playable_custom_object(*obj));
+	obj->set_pos(obj->x() - obj->current_frame().width() / 2 , obj->y() - obj->current_frame().height() / 2);
+
+	variant commands;
+	if(args().size() > 4) {
+		map_formula_callable_ptr callable = new map_formula_callable(&variables);
+		callable->add("child", variant(obj.get()));
+		commands = args()[4]->evaluate(*callable);
+	}
+
+	return variant(new spawn_command(obj, commands));
+
 END_FUNCTION_DEF(spawn_player)
 
 FUNCTION_DEF(object, 1, 5, "object(string type_id, int midpoint_x, int midpoint_y, int facing, (optional) map properties) -> object: constructs and returns a new object. Note that the difference between this and spawn is that spawn returns a command to actually place the object in the level. object only creates the object and returns it. It may be stored for later use.")
@@ -699,202 +683,15 @@ FUNCTION_DEF(set_var, 2, 2, "set_var(string varname, variant value): sets the va
 		args()[1]->evaluate(variables)));
 END_FUNCTION_DEF(set_var)
 
-class set_command : public entity_command_callable
-{
+class add_debug_rect_command : public game_logic::command_callable {
+	rect r_;
 public:
-	set_command(variant target, const std::string& attr, variant val)
-	  : target_(target), attr_(attr), val_(val)
-	{}
-	virtual void execute(level& lvl, entity& ob) const {
-		if(target_.is_callable()) {
-			target_.mutable_callable()->mutate_value(attr_, val_);
-		} else {
-			ob.mutate_value(attr_, val_);
-		}
-	}
-private:
-	variant target_;
-	std::string attr_;
-	variant val_;
-};
-
-class add_command : public entity_command_callable
-{
-public:
-	add_command(variant target, const std::string& attr, variant val)
-	  : target_(target), attr_(attr), val_(val)
-	{}
-	virtual void execute(level& lvl, entity& ob) const {
-		if(target_.is_callable()) {
-			target_.mutable_callable()->mutate_value(attr_, target_.mutable_callable()->query_value(attr_) + val_);
-		} else {
-			ob.mutate_value(attr_, ob.query_value(attr_) + val_);
-		}
-	}
-private:
-	variant target_;
-	std::string attr_;
-	variant val_;
-};
-
-class set_by_slot_command : public entity_command_callable
-{
-public:
-	set_by_slot_command(int slot, const variant& value)
-	  : slot_(slot), value_(value)
+	explicit add_debug_rect_command(const rect& r) : r_(r)
 	{}
 
-	virtual void execute(level& lvl, entity& obj) const {
-		obj.mutate_value_by_slot(slot_, value_);
+	virtual void execute(game_logic::formula_callable& ob) const {
+		add_debug_rect(r_);
 	}
-
-	void set_value(const variant& value) { value_ = value; }
-
-private:
-	int slot_;
-	variant value_;
-};
-
-class add_by_slot_command : public entity_command_callable
-{
-public:
-	add_by_slot_command(int slot, const variant& value)
-	  : slot_(slot), value_(value)
-	{}
-
-	virtual void execute(level& lvl, entity& obj) const {
-		obj.mutate_value_by_slot(slot_, obj.query_value_by_slot(slot_) + value_);
-	}
-
-	void set_value(const variant& value) { value_ = value; }
-
-private:
-	int slot_;
-	variant value_;
-};
-
-class set_function : public function_expression {
-public:
-	set_function(const args_list& args, const formula_callable_definition* callable_def)
-	  : function_expression("set", args, 2, 3), slot_(-1) {
-		if(args.size() == 2) {
-			variant literal = args[0]->is_literal();
-			if(literal.is_string()) {
-				key_ = literal.as_string();
-			} else {
-				args[0]->is_identifier(&key_);
-			}
-
-			if(!key_.empty() && callable_def) {
-				slot_ = callable_def->get_slot(key_);
-				if(slot_ != -1) {
-					cmd_ = boost::intrusive_ptr<set_by_slot_command>(new set_by_slot_command(slot_, variant()));
-				}
-			}
-		}
-	}
-private:
-	variant execute(const formula_callable& variables) const {
-		if(slot_ != -1) {
-			if(cmd_->refcount() == 1) {
-				cmd_->set_value(args()[1]->evaluate(variables));
-				return variant(cmd_.get());
-			}
-
-			cmd_ = boost::intrusive_ptr<set_by_slot_command>(new set_by_slot_command(slot_, args()[1]->evaluate(variables)));
-			return variant(cmd_.get());
-		}
-
-		if(!key_.empty()) {
-			return variant(new set_command(variant(), key_, args()[1]->evaluate(variables)));
-		}
-
-		if(args().size() == 2) {
-			try {
-				std::string member;
-				variant target = args()[0]->evaluate_with_member(variables, member);
-				return variant(new set_command(
-				  target, member, args()[1]->evaluate(variables)));
-			} catch(game_logic::formula_error&) {
-			}
-		}
-
-		variant target;
-		if(args().size() == 3) {
-			target = args()[0]->evaluate(variables);
-		}
-		const int begin_index = args().size() == 2 ? 0 : 1;
-		return variant(new set_command(
-		    target,
-		    args()[begin_index]->evaluate(variables).as_string(),
-			args()[begin_index + 1]->evaluate(variables)));
-	}
-
-	std::string key_;
-	int slot_;
-	mutable boost::intrusive_ptr<set_by_slot_command> cmd_;
-};
-
-class add_function : public function_expression {
-public:
-	add_function(const args_list& args, const formula_callable_definition* callable_def)
-	  : function_expression("add", args, 2, 3), slot_(-1) {
-		if(args.size() == 2) {
-			variant literal = args[0]->is_literal();
-			if(literal.is_string()) {
-				key_ = literal.as_string();
-			} else {
-				args[0]->is_identifier(&key_);
-			}
-
-			if(!key_.empty() && callable_def) {
-				slot_ = callable_def->get_slot(key_);
-				if(slot_ != -1) {
-					cmd_ = boost::intrusive_ptr<add_by_slot_command>(new add_by_slot_command(slot_, variant()));
-				}
-			}
-		}
-	}
-private:
-	variant execute(const formula_callable& variables) const {
-		if(slot_ != -1) {
-			if(cmd_->refcount() == 1) {
-				cmd_->set_value(args()[1]->evaluate(variables));
-				return variant(cmd_.get());
-			}
-
-			cmd_ = boost::intrusive_ptr<add_by_slot_command>(new add_by_slot_command(slot_, args()[1]->evaluate(variables)));
-			return variant(cmd_.get());
-		}
-
-		if(!key_.empty()) {
-			return variant(new add_command(variant(), key_, args()[1]->evaluate(variables)));
-		}
-
-		if(args().size() == 2) {
-			try {
-				std::string member;
-				variant target = args()[0]->evaluate_with_member(variables, member);
-				return variant(new add_command(
-				  target, member, args()[1]->evaluate(variables)));
-			} catch(game_logic::formula_error&) {
-			}
-		}
-
-		variant target;
-		if(args().size() == 3) {
-			target = args()[0]->evaluate(variables);
-		}
-		const int begin_index = args().size() == 2 ? 0 : 1;
-		return variant(new add_command(
-		    target,
-		    args()[begin_index]->evaluate(variables).as_string(),
-			args()[begin_index + 1]->evaluate(variables)));
-	}
-
-	std::string key_;
-	int slot_;
-	mutable boost::intrusive_ptr<add_by_slot_command> cmd_;
 };
 
 FUNCTION_DEF(solid, 3, 6, "solid(level, int x, int y, (optional)int w=1, (optional) int h=1, (optional) int debug=0) -> boolean: returns true iff the level contains solid space within the given (x,y,w,h) rectangle. If 'debug' is set, then the tested area will be displayed on-screen.")
@@ -915,7 +712,7 @@ FUNCTION_DEF(solid, 3, 6, "solid(level, int x, int y, (optional)int w=1, (option
 	return variant(lvl->solid(r));
 END_FUNCTION_DEF(solid)
 
-FUNCTION_DEF(debug_rect, 2, 5, "debug_rect(level, int x, int y, (optional)int w=1, (optional) int h=1, (optional) int cycle) -> Draws, for one frame, a rectangle on the level. Cycle may be changed to make the rectangle draw again.")
+FUNCTION_DEF(debug_rect, 2, 5, "debug_rect(int x, int y, (optional)int w=1, (optional) int h=1) -> Draws, for one frame, a rectangle on the level")
 	const int x = args()[0]->evaluate(variables).as_int();
 	const int y = args()[1]->evaluate(variables).as_int();
 
@@ -923,10 +720,18 @@ FUNCTION_DEF(debug_rect, 2, 5, "debug_rect(level, int x, int y, (optional)int w=
 	int h = args().size() >= 4 ? args()[3]->evaluate(variables).as_int() : 100;
 
 	rect r(x, y, w, h);
-	add_debug_rect(r);
-
-	return variant();
+	return variant(new add_debug_rect_command(r));
 END_FUNCTION_DEF(debug_rect)
+
+FUNCTION_DEF(plot_x, 1, 1, "plot_x(int x): plots a vertical debug line at the given position")
+	const int x = args()[0]->evaluate(variables).as_int();
+	return variant(new add_debug_rect_command(rect(x, -32000, 2, 64000)));
+END_FUNCTION_DEF(plot_x)
+
+FUNCTION_DEF(plot_y, 1, 1, "plot_y(int x): plots a horizontal debug line at the given position")
+	const int y = args()[0]->evaluate(variables).as_int();
+	return variant(new add_debug_rect_command(rect(-32000, y, 64000, 2)));
+END_FUNCTION_DEF(plot_y)
 
 FUNCTION_DEF(standable, 3, 5, "standable(level, int x, int y, (optional)int w=1, (optional) int h=1) -> boolean: returns true iff the level contains standable space within the given (x,y,w,h) rectangle")
 	level* lvl = args()[0]->evaluate(variables).convert_to<level>();
@@ -1009,12 +814,29 @@ public:
 		for(int n = 0; n != 50; ++n) {
 			draw_scene(lvl, pos, focus_.get());
 			SDL_GL_SwapBuffers();
+#if defined(__ANDROID__)
+			graphics::reset_opengl_state();
+#endif
 			SDL_Delay(20);
 		}
 	}
 private:
 	entity_ptr focus_;
 };
+
+FUNCTION_DEF(tiles_at, 2, 2, "tiles_at(x, y): gives a list of the tiles at the given x, y position")
+	formula::fail_if_static_context();
+
+	std::vector<variant> v;
+
+	std::pair<level::TileItor, level::TileItor> range = level::current().tiles_at_loc(args()[0]->evaluate(variables).as_int(), args()[1]->evaluate(variables).as_int());
+	while(range.first != range.second) {
+		v.push_back(variant(range.first->object));
+		++range.first;
+	}
+
+	return variant(&v);
+END_FUNCTION_DEF(tiles_at)
 
 FUNCTION_DEF(scroll_to, 1, 1, "scroll_to(object target): scrolls the screen to the target object")
 	return variant(new scroll_to_command(args()[0]->evaluate(variables).try_convert<entity>()));
@@ -1208,6 +1030,12 @@ private:
 				if(obj_cmd) {
 					obj_cmd->execute(lvl, ob);
 				}
+
+				const game_logic::command_callable* callable_cmd = var.try_convert<const game_logic::command_callable>();
+				if(callable_cmd) {
+					callable_cmd->execute(ob);
+				}
+
 			}
 
 			if(var.is_list()) {
@@ -1311,6 +1139,8 @@ private:
 						}
 					}
 
+					done = done || d->detect_joystick_press();
+
 					if(paused_)
 						done = done || d->process();
 					else if(!lvl.current_speech_dialog())
@@ -1338,6 +1168,9 @@ private:
 #endif
 
 		SDL_GL_SwapBuffers();
+#if defined(__ANDROID__)
+		graphics::reset_opengl_state();
+#endif
 		SDL_Delay(20);
 	}
 
@@ -1407,7 +1240,9 @@ public:
 	explicit debug_command(const std::string& str) : str_(str)
 	{}
 	virtual void execute(level& lvl, entity& ob) const {
+#ifndef NO_EDITOR
 		debug_console::add_message(str_);
+#endif
 		std::cerr << "CONSOLE: " << str_ << "\n";
 	}
 private:
@@ -1433,13 +1268,30 @@ FUNCTION_DEF(debug, 1, -1, "debug(...): outputs arguments to the console")
 	return variant(new debug_command(str));
 END_FUNCTION_DEF(debug)
 
-FUNCTION_DEF(debug_fn, 2, 2, "debug(msg, expr): evaluates and returns expr. Will print 'msg' to stderr")
+namespace {
+void debug_side_effect(variant v)
+{
+	if(v.is_list()) {
+		foreach(variant item, v.as_list()) {
+			debug_side_effect(item);
+		}
+	} else if(v.is_callable() && v.try_convert<game_logic::command_callable>()) {
+		map_formula_callable_ptr obj(new map_formula_callable);
+		v.try_convert<game_logic::command_callable>()->execute(*obj);
+	} else {
+		std::string s = v.to_debug_string();
+#ifndef NO_EDITOR
+		debug_console::add_message(s);
+#endif
+		std::cerr << "CONSOLE: " << s << "\n";
+	}
+}
+}
+
+FUNCTION_DEF(debug_fn, 2, 2, "debug(msg, expr): evaluates and returns expr. Will print 'msg' to stderr if it's printable, or execute it if it's an executable command.")
 	variant res = args()[1]->evaluate(variables);
 	if(preferences::debug()) {
-		variant msg = args()[0]->evaluate(variables);
-		std::string s = msg.to_debug_string();
-		debug_console::add_message(s);
-		std::cerr << "CONSOLE: " << s << "\n";
+		debug_side_effect(args()[0]->evaluate(variables));
 	}
 
 	return res;
@@ -1467,6 +1319,12 @@ END_FUNCTION_DEF(debug_console)
 
 #endif
 
+static int event_depth = 0;
+struct event_depth_scope {
+	event_depth_scope() { ++event_depth; }
+	~event_depth_scope() { --event_depth; }
+};
+
 class fire_event_command : public entity_command_callable {
 	const entity_ptr target_;
 	const std::string event_;
@@ -1477,10 +1335,29 @@ public:
 	{}
 
 	virtual void execute(level& lvl, entity& ob) const {
+		ASSERT_LOG(event_depth < 1000, "INFINITE (or too deep?) RECURSION FOR EVENT " << event_);
+		event_depth_scope scope;
 		entity* e = target_ ? target_.get() : &ob;
 		e->handle_event(event_, callable_.get());
 	}
 };
+
+namespace {
+const_formula_callable_ptr map_into_callable(variant v) {
+	if(v.is_callable()) {
+		return const_formula_callable_ptr(v.as_callable());
+	} else if(v.is_map()) {
+		map_formula_callable* res = new map_formula_callable;
+		foreach(const variant_pair& p, v.as_map()) {
+			res->add(p.first.as_string(), p.second);
+		}
+
+		return const_formula_callable_ptr(res);
+	} else {
+		return const_formula_callable_ptr();
+	}
+}
+}
 
 FUNCTION_DEF(fire_event, 1, 3, "fire_event((optional) object target, string id, (optional)callable arg): fires the event with the given id. Targets the current object by default, or target if given. Sends arg as the event argument if given")
 	entity_ptr target;
@@ -1495,7 +1372,7 @@ FUNCTION_DEF(fire_event, 1, 3, "fire_event((optional) object target, string id, 
 
 		target = v1.convert_to<entity>();
 		event = args()[1]->evaluate(variables).as_string();
-		callable = args()[2]->evaluate(variables).as_callable();
+		callable = map_into_callable(args()[2]->evaluate(variables));
 	} else if(args().size() == 2) {
 		variant v1 = args()[0]->evaluate(variables);
 		if(v1.is_null()) {
@@ -1505,7 +1382,7 @@ FUNCTION_DEF(fire_event, 1, 3, "fire_event((optional) object target, string id, 
 		variant v2 = args()[1]->evaluate(variables);
 		if(v1.is_string()) {
 			event = v1.as_string();
-			callable = v2.as_callable();
+			callable = map_into_callable(v2);
 		} else {
 			target = v1.convert_to<entity>();
 			event = v2.as_string();
@@ -1516,6 +1393,15 @@ FUNCTION_DEF(fire_event, 1, 3, "fire_event((optional) object target, string id, 
 
 	return variant(new fire_event_command(target, event, callable));
 END_FUNCTION_DEF(fire_event)
+
+FUNCTION_DEF(proto_event, 2, 2, "proto_event(prototype, event_name): for the given prototype, fire the named event. e.g. proto_event('playable', 'process')")
+	const std::string proto = args()[0]->evaluate(variables).as_string();
+	const std::string event_type = args()[1]->evaluate(variables).as_string();
+	const std::string event_name = proto + "_PROTO_" + event_type;
+	ASSERT_LOG(event_depth < 100, "Infinite (or too deep?) recursion in proto_event(" << proto << ", " << event_type << ")");
+	return variant(new fire_event_command(entity_ptr(), event_name, const_formula_callable_ptr(&variables)));
+	
+END_FUNCTION_DEF(proto_event)
 
 FUNCTION_DEF(get_object, 2, 2, "get_object(level, string label) -> object: returns the object that is present in the given level that has the given label")
 
@@ -1537,6 +1423,18 @@ public:
 	{}
 
 	virtual void execute(level& lvl, entity& ob) const {
+		if(xdir_ == 0 && ydir_ == 0 && max_cycles_ == 0) {
+			if(!place_entity_in_level_with_large_displacement(lvl, ob)) {
+				custom_object* custom_obj = dynamic_cast<custom_object*>(&ob);
+				if(custom_obj) {
+					//we really couldn't place it despite our best efforts ...
+					//killing it is our best choice.
+					custom_obj->die();
+				}
+				return;
+			}
+		}
+
 		const int start_x = e_->x();
 		const int start_y = e_->y();
 
@@ -1552,8 +1450,15 @@ public:
 	}
 };
 
-FUNCTION_DEF(resolve_solid, 3, 4, "resolve_solid(object, int xdir, int ydir, int max_cycles=100): will attempt to move the given object in the direction indicated by xdir/ydir until the object no longer has a solid overlap. Gives up after max_cycles")
+FUNCTION_DEF(resolve_solid, 1, 4, "resolve_solid(object, int xdir, int ydir, int max_cycles=100): will attempt to move the given object in the direction indicated by xdir/ydir until the object no longer has a solid overlap. Gives up after max_cycles. If called with no arguments other than the object, will try desperately to place the object in the level.")
 	entity_ptr e(args()[0]->evaluate(variables).try_convert<entity>());
+	if(args().size() == 1) {
+		return variant(new resolve_solid_command(e, 0, 0, 0));
+	} else if(args().size() == 2) {
+		std::cerr << "TWO ARGMENTS ISN'T A SUPPORTED OPTION FOR resolve_solid() CONTINUING AS IF ONE ARGUMENT SUPPLIED\n";
+		return variant(new resolve_solid_command(e, 0, 0, 0));
+	}
+
 	const int xdir = args()[1]->evaluate(variables).as_int();
 	const int ydir = args()[2]->evaluate(variables).as_int();
 	const int max_cycles = args().size() > 3 ? args()[3]->evaluate(variables).as_int() : 100;
@@ -1571,7 +1476,8 @@ public:
 	{}
 
 	virtual void execute(level& lvl, entity& ob) const {
-		if(place_entity_in_level(lvl, *e_)) {
+		e_->set_spawned_by(ob.label());
+		if(place_entity_in_level_with_large_displacement(lvl, *e_)) {
 			lvl.add_character(e_);
 		} else {
 			collision_info collide_info;
@@ -1866,30 +1772,51 @@ END_FUNCTION_DEF(blur)
 
 class text_command : public custom_object_command_callable {
 public:
-	text_command(const std::string& text, const std::string& font, int size, bool centered)
-	  : text_(text), font_(font), size_(size), centered_(centered) {
+	text_command(const std::string& text, const std::string& font, int size, int align)
+	  : text_(text), font_(font), size_(size), align_(align) {
 	}
 
 	virtual void execute(level& lvl, custom_object& ob) const {
-		ob.set_text(text_, font_, size_*2, centered_);
+		ob.set_text(text_, font_, size_*2, align_);
 	}
 private:
 	std::string text_, font_;
 	int size_;
-	bool centered_;
+	int align_;
 };
 
 FUNCTION_DEF(text, 1, 4, "text(string text, (optional)string font='default', (optional)int size=1, (optional)bool centered=false): adds text for the current object")
 	const std::string text = args()[0]->evaluate(variables).as_string();
 	const std::string font = args().size() > 1 ? args()[1]->evaluate(variables).as_string() : "default";
 	const int size = args().size() > 2 ? args()[2]->evaluate(variables).as_int() : 1;
-	const bool centered = args().size() > 3 ? args()[3]->evaluate(variables).as_bool() : false;
-	return variant(new text_command(text, font, size, centered));
+
+	int align = -1;
+	if(args().size() > 3) {
+		variant align_var = args()[3]->evaluate(variables);
+		if(align_var.is_string()) {
+			const std::string str = align_var.as_string();
+			if(str == "left") {
+				align = -1;
+			} else if(str == "center") {
+				align = 0;
+			} else if(str == "right") {
+				align = 1;
+			}
+
+		} else {
+			align = align_var.as_bool() ? 0 : -1;
+		}
+	}
+	return variant(new text_command(text, font, size, align));
 END_FUNCTION_DEF(text)
 
 FUNCTION_DEF(swallow_event, 0, 0, "swallow_event(): when used in an instance-specific event handler, this causes the event to be swallowed and not passed to the object's main event handler.")
 	return variant(new swallow_object_command_callable);
 END_FUNCTION_DEF(swallow_event)
+
+FUNCTION_DEF(swallow_mouse_event, 0, 0, "swallow_event(): when used in an instance-specific event handler, this causes the mouse event to be swallowed and not passed to the next object in the z-order stack.")
+	return variant(new swallow_mouse_command_callable);
+END_FUNCTION_DEF(swallow_mouse_event)
 
 class add_level_module_command : public entity_command_callable {
 	std::string lvl_;
@@ -1939,6 +1866,37 @@ FUNCTION_DEF(cosmic_shift, 2, 2, "cosmic_shift(int xoffset, int yoffet): adjust 
 	return variant(new shift_level_position_command(args()[0]->evaluate(variables).as_int(), args()[1]->evaluate(variables).as_int()));
 END_FUNCTION_DEF(cosmic_shift)
 
+FUNCTION_DEF(rotate_rect, 4, 4, "rotate_rect(int center_x, int center_y, int rotation, int[8] rect) -> int[8]: rotates rect and returns the result")
+
+	int center_x = args()[0]->evaluate(variables).as_int();
+	int center_y = args()[1]->evaluate(variables).as_int();
+	float rotate = args()[2]->evaluate(variables).as_decimal().as_float();
+
+	variant v = args()[3]->evaluate(variables);
+
+	ASSERT_LE(v.num_elements(), 8);
+	
+	GLshort r[8];
+	for(int n = 0; n != v.num_elements(); ++n) {
+		r[n] = v[n].as_int();
+	}
+
+	for(int n = v.num_elements(); n < 8; ++n) {
+		r[n] = 0;
+	}
+
+	rotate_rect(center_x, center_y, rotate, r);
+
+	std::vector<variant> res;
+	res.reserve(8);
+	for(int n = 0; n != v.num_elements(); ++n) {
+		res.push_back(variant(r[n]));
+	}
+
+	return variant(&res);
+
+END_FUNCTION_DEF(rotate_rect)
+
 namespace {
 bool consecutive_periods(char a, char b) {
 	return a == '.' && b == '.';
@@ -1947,13 +1905,13 @@ bool consecutive_periods(char a, char b) {
 
 FUNCTION_DEF(eval, 1, 2, "eval(string formula, [obj context]): evaluate the given formula in the given context")
 	std::map<std::string, game_logic::formula_ptr> cache;
-	const std::string fml = args()[0]->evaluate(variables).as_string();
-	game_logic::formula_ptr& f = cache[fml];
+	const variant fml = args()[0]->evaluate(variables);
+	game_logic::formula_ptr& f = cache[fml.as_string()];
 	if(f.get() == NULL) {
 		f = game_logic::formula::create_optional_formula(fml);
 	}
 
-	ASSERT_LOG(f.get() != NULL, "INVALID FORMULA PASSED TO EVAL: " << fml);
+	ASSERT_LOG(f.get() != NULL, "INVALID FORMULA PASSED TO EVAL: " << fml.as_string());
 
 	if(args().size() > 1) {
 		return f->execute(*args()[1]->evaluate(variables).as_callable());
@@ -1962,16 +1920,11 @@ FUNCTION_DEF(eval, 1, 2, "eval(string formula, [obj context]): evaluate the give
 	}
 END_FUNCTION_DEF(eval)
 
-FUNCTION_DEF(get_document, 1, 2, "get_document(string doc, [string schema]): return reference to the given WML document, optionally using the given schema")
+FUNCTION_DEF(get_document, 1, 1, "get_document(string filename): return reference to the given JSON document")
 	const std::string docname = args()[0]->evaluate(variables).as_string();
-	std::string schema;
-	if(args().size() > 1) {
-		schema = args()[1]->evaluate(variables).as_string();
-	}
 
-	static std::map<std::pair<std::string,std::string>, variant> cache;
-	std::pair<std::string, std::string> key(docname, schema);
-	variant& v = cache[key];
+	static std::map<std::string, variant> cache;
+	variant& v = cache[docname];
 	if(v.is_null() == false) {
 		return v;
 	}
@@ -1980,16 +1933,12 @@ FUNCTION_DEF(get_document, 1, 2, "get_document(string doc, [string schema]): ret
 	ASSERT_LOG(docname[0] != '/', "DOCUMENT NAME BEGINS WITH / " << docname);
 	ASSERT_LOG(std::adjacent_find(docname.begin(), docname.end(), consecutive_periods) == docname.end(), "DOCUMENT NAME CONTAINS ADJACENT PERIODS " << docname);
 
-	const wml::schema* sch = NULL;
-	if(schema.empty() == false) {
-		sch = wml::schema::get(schema);
-		ASSERT_LOG(sch != NULL, "COULD NOT FIND SCHEMA: " << schema);
+	try {
+		const variant v = json::parse_from_file(docname);
+		return v;
+	} catch(json::parse_error&) {
+		return variant();
 	}
-
-	const wml::node_ptr doc = wml::parse_wml_from_file(docname, sch);
-
-	v = variant(new wml::node_callable(doc));
-	return v;
 END_FUNCTION_DEF(get_document)
 
 class custom_object_function_symbol_table : public function_symbol_table
@@ -2006,14 +1955,9 @@ expression_ptr custom_object_function_symbol_table::create_function(
                            const std::vector<expression_ptr>& args,
 						   const formula_callable_definition* callable_def) const
 {
-	if(fn == "set") {
-		return expression_ptr(new set_function(args, callable_def));
-	} else if(fn == "add") {
-		return expression_ptr(new add_function(args, callable_def));
-	}
-
-	std::map<std::string, function_creator*>::const_iterator i = function_creators().find(fn);
-	if(i != function_creators().end()) {
+	const std::map<std::string, function_creator*>& creators = get_function_creators(FunctionModule);
+	std::map<std::string, function_creator*>::const_iterator i = creators.find(fn);
+	if(i != creators.end()) {
 		return expression_ptr(i->second->create(args));
 	}
 
@@ -2030,13 +1974,11 @@ function_symbol_table& get_custom_object_functions_symbol_table()
 	return table;
 }
 
-void init_custom_object_functions(wml::const_node_ptr node)
+void init_custom_object_functions(variant node)
 {
-	wml::node::const_child_iterator i1 = node->begin_child("function");
-	wml::node::const_child_iterator i2 = node->end_child("function");
-	for(; i1 != i2; ++i1) {
-		const std::string& name = i1->second->attr("name");
-		std::vector<std::string> args = util::split(i1->second->attr("args"));
+	foreach(variant fn, node.as_list()) {
+		const std::string& name = fn["name"].as_string();
+		std::vector<std::string> args = util::split(fn["args"].as_string());
 
 		const std::string* first_arg = NULL;
 		const std::string* last_arg = NULL;
@@ -2047,19 +1989,21 @@ void init_custom_object_functions(wml::const_node_ptr node)
 
 		game_logic::formula_callable_definition_ptr args_definition = game_logic::create_formula_callable_definition(first_arg, last_arg);
 
-		recursive_function_symbol_table recursive_symbols(name, args, &get_custom_object_functions_symbol_table());
-		const_formula_ptr fml(new formula(i1->second->attr("formula"), &recursive_symbols, args_definition.get()));
+		std::vector<variant> default_args;
+		recursive_function_symbol_table recursive_symbols(name, args, default_args, &get_custom_object_functions_symbol_table(), NULL);
+		const_formula_ptr fml(new formula(fn["formula"], &recursive_symbols, args_definition.get()));
 		get_custom_object_functions_symbol_table().add_formula_function(
-		    name, fml, const_formula_ptr(), args);
+		    name, fml, const_formula_ptr(), args, default_args);
 		recursive_symbols.resolve_recursive_calls(fml);
 		std::vector<std::string> names = get_custom_object_functions_symbol_table().get_function_names();
-		assert(std::count(names.begin(), names.end(), i1->second->attr("name").val()));
+		assert(std::count(names.begin(), names.end(), fn["name"].as_string()));
 	}
 }
 
 UTILITY(document_object_functions) {
-	std::sort(function_helpstrings().begin(), function_helpstrings().end());
-	foreach(std::string s, function_helpstrings()) {
+	std::vector<std::string> helpstrings = function_helpstrings(FunctionModule);
+	std::sort(helpstrings.begin(), helpstrings.end());
+	foreach(std::string s, helpstrings) {
 		std::string::iterator i = std::find(s.begin(), s.end(), ':');
 		if(i != s.end()) {
 			s = "{{{ " + std::string(s.begin(), i) + " }}}" + std::string(i, s.end());

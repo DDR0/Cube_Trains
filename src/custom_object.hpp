@@ -1,8 +1,11 @@
 #ifndef CUSTOM_OBJECT_HPP_INCLUDED
 #define CUSTOM_OBJECT_HPP_INCLUDED
 
+#include <set>
+
+#include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
-#include <inttypes.h>
+#include <boost/cstdint.hpp>
 #include <stack>
 
 #include "blur.hpp"
@@ -17,7 +20,6 @@
 #include "particle_system.hpp"
 #include "raster_distortion.hpp"
 #include "variant.hpp"
-#include "wml_node_fwd.hpp"
 
 class collision_info;
 class level;
@@ -27,9 +29,11 @@ struct custom_object_text;
 class custom_object : public entity
 {
 public:
+	static std::set<custom_object*>& get_all();
+	static std::set<custom_object*>& get_all(const std::string& type);
 	static void init();
 
-	explicit custom_object(wml::const_node_ptr node);
+	explicit custom_object(variant node);
 	custom_object(const std::string& type, int x, int y, bool face_right);
 	custom_object(const custom_object& o);
 	virtual ~custom_object();
@@ -37,7 +41,7 @@ public:
 	//finish_loading(): called when a level finishes loading all objects,
 	//and allows us to do any final setup such as finding our parent.
 	void finish_loading();
-	virtual wml::node_ptr write() const;
+	virtual variant write() const;
 	virtual void setup_drawing() const;
 	virtual void draw() const;
 	virtual void draw_group() const;
@@ -95,7 +99,7 @@ public:
 	virtual bool is_active(const rect& screen_area) const;
 	bool dies_on_inactive() const;
 	bool always_active() const;
-	void move_to_standing(level& lvl);
+	bool move_to_standing(level& lvl, int max_displace=10000);
 
 	bool body_harmful() const;
 	bool body_passthrough() const;
@@ -110,7 +114,7 @@ public:
 	int surface_friction() const;
 	int surface_traction() const;
 
-	wml::const_node_ptr get_child(const std::string& key) const {
+	variant get_child(const std::string& key) const {
 		return type_->get_child(key);
 	}
 
@@ -131,7 +135,7 @@ public:
 	void add_particle_system(const std::string& key, const std::string& type);
 	void remove_particle_system(const std::string& key);
 
-	void set_text(const std::string& text, const std::string& font, int size, bool centered);
+	void set_text(const std::string& text, const std::string& font, int size, int align);
 
 	virtual int hitpoints() const { return hitpoints_; }
 
@@ -147,10 +151,15 @@ public:
 
 	virtual int current_animation_id() const { return current_animation_id_; }
 
+#ifndef NO_EDITOR
 	virtual const_editor_entity_info_ptr editor_info() const;
+#endif // !NO_EDITOR
 
 	virtual void handle_event(const std::string& event, const formula_callable* context=NULL);
 	virtual void handle_event(int event, const formula_callable* context=NULL);
+	virtual void handle_event_delay(int event, const formula_callable* context=NULL);
+
+	virtual void resolve_delayed_events();
 
 	virtual bool serializable() const;
 
@@ -177,7 +186,17 @@ public:
 
 	void set_difficulty(int min, int max) { min_difficulty_ = min; max_difficulty_ = max; }
 
+	void update_type(const_custom_object_type_ptr old_type,
+	                 const_custom_object_type_ptr new_type);
+
+	const bool mouse_event_swallowed() {return swallow_mouse_event_;}
+	void reset_mouse_event() {swallow_mouse_event_ = false;}
+
 protected:
+	//components of per-cycle process() that can be done even on
+	//static objects.
+	void static_process(level& lvl);
+
 	virtual void control(const level& lvl);
 	variant get_value(const std::string& key) const;
 	variant get_value_by_slot(int slot) const;
@@ -201,22 +220,33 @@ protected:
 
 	virtual int parent_depth(int cur_depth=0) const;
 
+	virtual bool editor_force_standing() const;
+
+	entity_ptr standing_on() const { return standing_on_; }
+
+	virtual rect platform_rect_at(int xpos) const;
+
+	virtual bool solid_platform() const;
+
+
 private:
 	custom_object& operator=(const custom_object& o);
 	struct Accessor;
 
+	bool move_to_standing_internal(level& lvl, int max_displace);
+
 	void process_frame();
 
-	const solid_info* calculate_solid() const;
-	const solid_info* calculate_platform() const;
+	const_solid_info_ptr calculate_solid() const;
+	const_solid_info_ptr calculate_platform() const;
 
-	void get_inputs(std::vector<game_logic::formula_input>* inputs) const;
+	virtual void get_inputs(std::vector<game_logic::formula_input>* inputs) const;
 
 	int slope_standing_on(int range) const;
 
 	int previous_y_;
 
-	wml::const_node_ptr custom_type_;
+	variant custom_type_;
 	const_custom_object_type_ptr type_; //the type after variations are applied
 	const_custom_object_type_ptr base_type_; //the type without any variation
 	std::vector<std::string> current_variation_;
@@ -329,7 +359,16 @@ private:
 
 	int min_difficulty_, max_difficulty_;
 
+	boost::shared_ptr<const std::vector<frame::CustomPoint> > custom_draw_;
+
 	void set_platform_area(const rect& area);
+
+	std::vector<int> platform_offsets_;
+
+	bool swallow_mouse_event_;
+
+	void handle_event_internal(int event, const formula_callable* context, bool execute_commands_now=true);
+	std::vector<variant> delayed_commands_;
 };
 
 #endif

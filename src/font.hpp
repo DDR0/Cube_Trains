@@ -14,12 +14,7 @@
 
 #include <string>
 
-#include "SDL.h"
-
-#if !TARGET_IPHONE_SIMULATOR && !TARGET_OS_HARMATTAN && !TARGET_OS_IPHONE
-#include "SDL_ttf.h"
-#endif
-
+#include "graphics.hpp"
 #include "texture.hpp"
 
 namespace font {
@@ -34,6 +29,8 @@ struct error {
 
 graphics::texture render_text(const std::string& text,
                               const SDL_Color& color, int size);
+graphics::texture render_text_uncached(const std::string& text,
+                                       const SDL_Color& color, int size);
 
 int char_width(int size);
 int char_height(int size);

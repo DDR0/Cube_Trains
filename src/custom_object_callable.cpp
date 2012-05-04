@@ -1,6 +1,8 @@
 #include "asserts.hpp"
 #include "custom_object_callable.hpp"
 
+#include <pthread.h>
+
 namespace {
 std::vector<custom_object_callable::entry>& global_entries() {
 	static std::vector<custom_object_callable::entry> instance;
@@ -28,7 +30,8 @@ custom_object_callable::custom_object_callable()
 	"time_in_animation", "time_in_animation_delta", "level",
 	"animation", "available_animations",
 	"hitpoints", "max_hitpoints", "mass", "label", "x", "y", "xy", "z",
-	"relative_x", "relative_y", "parent", "pivot", "zorder", "zsub_order",
+	"relative_x", "relative_y", "spawned_by", "spawned_children",
+	"parent", "pivot", "zorder", "zsub_order",
 	"previous_y", "x1", "x2", "y1", "y2", "w", "h", "mid_x", "mid_y", "midpoint_x", "midpoint_y",
 	"solid_rect", "solid_mid_x", "solid_mid_y", "img_mid_x", "img_mid_y","img_w", "img_h", "front", "back", "cycle", "facing",
 	"upside_down", "up", "down", "velocity_x", "velocity_y",
@@ -36,7 +39,8 @@ custom_object_callable::custom_object_callable()
 	"registry", "globals", "vars", "tmp", "group", "rotate",
 	"me", "self",
 	"red", "green", "blue", "alpha", "text_alpha", "damage", "hit_by",
-	"distortion", "is_standing", "near_cliff_edge", "distance_to_cliff",
+	"distortion", "is_standing", "standing_info",
+	"near_cliff_edge", "distance_to_cliff",
 	"slope_standing_on", "underwater", "water_bounds", "water_object",
 	"driver", "is_human", "invincible",
 	"sound_volume", "destroyed", "is_standing_on_platform", "standing_on",
@@ -48,7 +52,7 @@ custom_object_callable::custom_object_callable()
 	"activation_area", "clip_area",
 	"always_active", "activation_border", "fall_through_platforms", "has_feet",
 	"x_schedule", "y_schedule", "rotation_schedule", "schedule_speed",
-	"platform_area",
+	"platform_area", "platform_offsets", "custom_draw", "event_handlers",
 	"ctrl_up", "ctrl_down", "ctrl_left", "ctrl_right",
 	"ctrl_attack", "ctrl_jump", "ctrl_tongue",
 };
@@ -99,3 +103,4 @@ const game_logic::formula_callable_definition::entry* custom_object_callable::ge
 
 	return &entries_[slot];
 }
+

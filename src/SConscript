@@ -5,18 +5,18 @@ env.Append(CXXFLAGS= ["-pthread", "-DIMPLEMENT_SAVE_PNG"], LINKFLAGS = ["-pthrea
 sources = Split("""
 IMG_savepng.cpp
 achievements.cpp
+animation_preview_widget.cpp
+asserts.cpp
 background.cpp
 blur.cpp
 border_widget.cpp
 button.cpp
 character_editor_dialog.cpp
 current_generator.cpp
-editor_dialogs.cpp
-editor_formula_functions.cpp
-editor_layers_dialog.cpp
-editor_stats_dialog.cpp
-editor_variable_info.cpp
 checkbox.cpp
+clipboard.cpp
+code_editor_dialog.cpp
+code_editor_widget.cpp
 collision_utils.cpp
 color_utils.cpp
 controls.cpp
@@ -25,12 +25,20 @@ custom_object.cpp
 custom_object_callable.cpp
 custom_object_functions.cpp
 custom_object_type.cpp
-debug_console.cpp dialog.cpp
+debug_console.cpp
 decimal.cpp
-draw_number.cpp draw_scene.cpp
+dialog.cpp
+draw_number.cpp
+draw_scene.cpp
 draw_tile.cpp
 editor.cpp
+editor_dialogs.cpp
+editor_formula_functions.cpp
+editor_layers_dialog.cpp
 editor_level_properties_dialog.cpp
+editor_stats_dialog.cpp
+editor_variable_info.cpp
+external_text_editor.cpp
 entity.cpp
 filesystem.cpp
 font.cpp
@@ -38,6 +46,7 @@ formula.cpp
 formula_callable_definition.cpp
 formula_constants.cpp
 formula_function.cpp
+formula_function_registry.cpp
 formula_profiler.cpp
 formula_tokenizer.cpp
 formula_variable_storage.cpp
@@ -55,9 +64,10 @@ gui_section.cpp
 i18n.cpp
 image_widget.cpp
 input.cpp
-inventory.cpp
 iphone_controls.cpp
 joystick.cpp
+json_parser.cpp
+json_tokenizer.cpp
 key.cpp
 key_button.cpp
 label.cpp
@@ -70,6 +80,7 @@ light.cpp
 load_level_nothread.cpp
 main.cpp
 message_dialog.cpp
+module.cpp
 movement_script.cpp
 multi_tile_pattern.cpp
 multiplayer.cpp
@@ -80,7 +91,6 @@ particle_system.cpp
 pause_game_dialog.cpp
 playable_custom_object.cpp
 player_info.cpp
-powerup.cpp
 preferences.cpp
 preprocessor.cpp
 preview_tileset_widget.cpp
@@ -106,6 +116,7 @@ surface_scaling.cpp
 surface.cpp
 texture.cpp
 texture_frame_buffer.cpp
+text_editor_widget.cpp
 text_entry_widget.cpp
 thread.cpp
 tile_map.cpp
@@ -114,23 +125,18 @@ tooltip.cpp
 translate.cpp
 utils.cpp
 variant.cpp
+variant_callable.cpp
+variant_utils.cpp
 water.cpp
 water_particle_system.cpp
 weather_particle_system.cpp
 widget.cpp
-wml_formula_adapter.cpp
 wml_formula_callable.cpp
-wml_modify.cpp
-wml_node.cpp
-wml_parser.cpp
-wml_schema.cpp
-wml_utils.cpp
-wml_writer.cpp
 unit_test.cpp
 formula_test.cpp
-wml_parser_test.cpp
 loading_screen.cpp
 utility_object_compiler.cpp
-utility_object_editor.cpp
+utility_query.cpp
+utility_render_level.cpp
 """)
 env.Program("#/game", sources)

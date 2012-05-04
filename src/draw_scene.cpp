@@ -1,13 +1,5 @@
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
-#include <GLES/gl.h>
-#ifdef TARGET_PANDORA
-#include <GLES/glues.h>
-#endif
-#else
-#include <GL/gl.h>
-#include <GL/glu.h>
-#endif
-#include <SDL.h>
+#include "graphics.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -20,6 +12,7 @@
 #include "debug_console.hpp"
 #include "draw_number.hpp"
 #include "draw_scene.hpp"
+#include "editor.hpp"
 #include "font.hpp"
 #include "foreach.hpp"
 #include "globals.h"
@@ -38,6 +31,7 @@
 namespace {
 
 std::vector<rect> current_debug_rects;
+int current_debug_rects_valid_cycle = -1;
 
 std::string& scene_title() {
 	static std::string title;
@@ -72,10 +66,26 @@ screen_position& last_draw_position()
 	return last_position;
 }
 
+namespace {
+int g_flash_disable = 0;
+}
+
+disable_flashes_scope::disable_flashes_scope()
+{
+	++g_flash_disable;
+}
+
+disable_flashes_scope::~disable_flashes_scope()
+{
+	--g_flash_disable;
+}
+
 void screen_color_flash(const graphics::color_transform& color, const graphics::color_transform& color_delta, int duration)
 {
-	screen_flash f = { color, color_delta, duration };
-	flashes().push_back(f);
+	if(!g_flash_disable) {
+		screen_flash f = { color, color_delta, duration };
+		flashes().push_back(f);
+	}
 }
 
 void set_scene_title(const std::string& msg, int duration) {
@@ -106,6 +116,17 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 	//flag which gets set to false if we abort drawing, due to the
 	//screen position being initialized now.
 	const bool draw_level = do_draw && pos.init;
+	
+#ifndef NO_EDITOR
+	const int sidebar_width = editor::sidebar_width();
+	const int codebar_height = editor::codebar_height();
+#else
+	const int sidebar_width = 0;
+	const int codebar_height = 0;
+#endif
+
+	const int screen_width = graphics::screen_width() - (lvl.in_editor() ? sidebar_width : 0);
+	const int screen_height = graphics::screen_height() - (lvl.in_editor() ? codebar_height : 0);
 
 	if(focus) {
 		// If the camera is automatically moved along by the level (e.g. a 
@@ -116,19 +137,19 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 		//find how much padding will have to be on the edge of the screen due
 		//to the level being wider than the screen. This value will be 0
 		//if the level is larger than the screen (i.e. most cases)
-		const int x_screen_pad = std::max<int>(0, graphics::screen_width() - lvl.boundaries().w());
+		const int x_screen_pad = std::max<int>(0, screen_width - lvl.boundaries().w());
 
-		const int y_screen_pad = std::max<int>(0, graphics::screen_height() - lvl.boundaries().h());
+		const int y_screen_pad = std::max<int>(0, screen_height - lvl.boundaries().h());
 
 		//find the boundary values for the camera position based on the size
 		//of the level. These boundaries keep the camera from ever going out
 		//of the bounds of the level.
-		const int min_x = lvl.boundaries().x() + graphics::screen_width()/2 - x_screen_pad/2;
-		const int max_x = lvl.boundaries().x2() - graphics::screen_width()/2 + x_screen_pad/2;
-		const int min_y = lvl.boundaries().y() + graphics::screen_height()/2 - y_screen_pad/2;
-		const int max_y = lvl.boundaries().y2() - graphics::screen_height()/2 + y_screen_pad/2;
+		const int min_x = lvl.boundaries().x() + screen_width/2 - x_screen_pad/2;
+		const int max_x = lvl.boundaries().x2() - screen_width/2 + x_screen_pad/2;
+		const int min_y = lvl.boundaries().y() + screen_height/2 - y_screen_pad/2;
+		const int max_y = lvl.boundaries().y2() - screen_height/2 + y_screen_pad/2;
 
-		//std::cerr << "BOUNDARIES: " << lvl.boundaries().x() << ", " << lvl.boundaries().x2() << " WIDTH: " << graphics::screen_width() << " PAD: " << x_screen_pad << "\n";
+		//std::cerr << "BOUNDARIES: " << lvl.boundaries().x() << ", " << lvl.boundaries().x2() << " WIDTH: " << screen_width << " PAD: " << x_screen_pad << "\n";
 
 		//we look a certain number of frames ahead -- assuming the focus
 		//keeps moving at the current velocity, we converge toward the point
@@ -155,7 +176,7 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 		const int vertical_look = focus->vertical_look();
 
 		//find the y point for the camera to converge toward
-		int y = std::min(std::max(focus->feet_y() - graphics::screen_height()/(5*lvl.zoom_level()) + displacement_y*PredictiveFramesVert + vertical_look, min_y), max_y);
+		int y = std::min(std::max(focus->feet_y() - (screen_height/(5*lvl.zoom_level())).as_int() + displacement_y*PredictiveFramesVert + vertical_look, min_y), max_y);
 
 		//std::cerr << "POSITION: " << x << "," << y << " IN " << min_x << "," << min_y << "," << max_x << "," << max_y << "\n";
 
@@ -175,7 +196,7 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 				}
 
 				const int BorderSize = 20;
-				if(v.size() == 1 || right - left < graphics::screen_width()/lvl.zoom_level() - BorderSize && bottom - top < graphics::screen_height()/lvl.zoom_level() - BorderSize) {
+				if(v.size() == 1 || right - left < screen_width/lvl.zoom_level() - BorderSize && bottom - top < screen_height/lvl.zoom_level() - BorderSize) {
 					break;
 				}
 
@@ -185,7 +206,7 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 			}
 
 			x = std::min(std::max((left + right)/2, min_x), max_x);
-			y = std::min(std::max((top + bottom)/2 - graphics::screen_height()/(5*lvl.zoom_level()), min_y), max_y);
+			y = std::min(std::max(((top + bottom)/2 - screen_height/(5*lvl.zoom_level())).as_int(), min_y), max_y);
 		}
 
 
@@ -199,15 +220,15 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 		//for small screens the speech dialog arrows cover the entities they are
 		//pointing to. adjust to that by looking up a little bit.
 		if (lvl.current_speech_dialog() && preferences::virtual_screen_height() < 600)
-			y = std::min(y + (600 - graphics::screen_height())/(2*lvl.zoom_level()), max_y);
+			y = std::min((y + (600 - screen_height)/(2*lvl.zoom_level())).as_int(), max_y);
 
 		//find the target x,y position of the camera in centi-pixels. Note that
 		//(x,y) represents the position the camera should center on, while
 		//now we're calculating the top-left point.
 		//
 		//the actual camera position will converge toward this point
-		const int target_xpos = 100*(x - graphics::screen_width()/2);
-		const int target_ypos = 100*(y - graphics::screen_height()/2);
+		const int target_xpos = 100*(x - screen_width/2);
+		const int target_ypos = 100*(y - screen_height/2);
 
 		if(pos.init == false) {
 			pos.x = target_xpos;
@@ -218,8 +239,8 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 			//We do this by moving asymptotically toward the target, which
 			//makes the camera have a nice acceleration/decceleration effect
 			//as the target position moves.
-			const int horizontal_move_speed = 30/lvl.zoom_level();
-			const int vertical_move_speed = 10/lvl.zoom_level();
+			const int horizontal_move_speed = (30/lvl.zoom_level()).as_int();
+			const int vertical_move_speed = (10/lvl.zoom_level()).as_int();
 			int xdiff = (target_xpos - pos.x)/horizontal_move_speed;
 			int ydiff = (target_ypos - pos.y)/vertical_move_speed;
 
@@ -269,7 +290,7 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 			}
 		}
 
-		const int target_zoom = lvl.zoom_level();
+		const float target_zoom = lvl.zoom_level().as_float();
 		const float ZoomSpeed = 0.03;
 		if(std::abs(target_zoom - pos.zoom) < ZoomSpeed) {
 			pos.zoom = target_zoom;
@@ -286,6 +307,13 @@ bool update_camera_position(const level& lvl, screen_position& pos, const entity
 }
 
 void render_scene(const level& lvl, screen_position& pos, const entity* focus, bool do_draw) {
+#ifndef NO_EDITOR
+	const int sidebar_width = editor::sidebar_width();
+#else
+	const int sidebar_width = 0;
+#endif
+	const int screen_width = graphics::screen_width() - (lvl.in_editor() ? sidebar_width : 0);
+
 	graphics::prepare_raster();
 	glPushMatrix();
 
@@ -310,22 +338,32 @@ void render_scene(const level& lvl, screen_position& pos, const entity* focus, b
 	int xscroll = (pos.x/100)&preferences::xypos_draw_mask;
 	int yscroll = (pos.y/100)&preferences::xypos_draw_mask;
 
-	if(pos.zoom > 1.0) {
+//	if(pos.zoom > 1.0) {
 		glScalef(pos.zoom, pos.zoom, 0);
-		xscroll += (graphics::screen_width()/2)*(-1.0/pos.zoom + 1.0);
+		xscroll += (screen_width/2)*(-1.0/pos.zoom + 1.0);
 		yscroll += (graphics::screen_height()/2)*(-1.0/pos.zoom + 1.0);
-	}
+//	}
 
 	glTranslatef(-xscroll, -yscroll, 0);
 	lvl.draw_background(xscroll, yscroll, camera_rotation);
 
-	lvl.draw(xscroll, yscroll, graphics::screen_width(), graphics::screen_height());
+	int draw_width = screen_width;
+	int draw_height = graphics::screen_height();
+	if(pos.zoom < 1.0) {
+		draw_width /= pos.zoom;
+		draw_height /= pos.zoom;
+	}
+	lvl.draw(xscroll, yscroll, draw_width, draw_height);
 
 	foreach(const rect& r, current_debug_rects) {
 		graphics::draw_rect(r, graphics::color(0, 0, 255, 175));
 	}
 
-	current_debug_rects.clear();
+	if(current_debug_rects_valid_cycle != lvl.cycle()) {
+		current_debug_rects.clear();
+	}
+
+	current_debug_rects_valid_cycle = lvl.cycle();
 
 	graphics::clear_raster_distortion();
 	glPopMatrix();
@@ -349,7 +387,9 @@ void render_scene(const level& lvl, screen_position& pos, const entity* focus, b
 		}
 	}
 
+#ifndef NO_EDITOR
 	debug_console::draw();
+#endif
 
 	if (!pause_stack) lvl.draw_status();
 

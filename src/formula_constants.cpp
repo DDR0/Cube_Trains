@@ -9,7 +9,7 @@
 #include "preferences.hpp"
 #include "raster.hpp"
 #include "string_utils.hpp"
-#include "wml_node.hpp"
+#include "variant_utils.hpp"
 
 namespace game_logic
 {
@@ -28,13 +28,13 @@ variant get_constant(const std::string& id)
 	} else if(id == "SCREEN_HEIGHT") {
 		return variant(graphics::screen_height());
 	} else if(id == "LOW_END_SYSTEM") {
-#if TARGET_OS_HARMATTAN || TARGET_OS_IPHONE || TARGET_BLACKBERRY
+#if TARGET_OS_HARMATTAN || TARGET_OS_IPHONE || TARGET_BLACKBERRY || defined(__ANDROID__)
 		return variant(1);
 #else
 		return variant(0);
 #endif
 	} else if(id == "IPHONE_SYSTEM") {
-#if TARGET_OS_HARMATTAN || TARGET_OS_IPHONE || TARGET_BLACKBERRY
+#if TARGET_OS_HARMATTAN || TARGET_OS_IPHONE || TARGET_BLACKBERRY || defined(__ANDROID__)
 		return variant(1);
 #else
 		return variant(preferences::sim_iphone() ? 1 : 0);
@@ -70,50 +70,23 @@ variant get_constant(const std::string& id)
 	return variant();
 }
 
-constants_loader::constants_loader(wml::const_node_ptr node) : same_as_base_(false)
+constants_loader::constants_loader(variant node) : same_as_base_(false)
 {
 	constants_map m;
-	if(node) {
-		for(wml::node::const_attr_iterator i = node->begin_attr(); i != node->end_attr(); ++i) {
-			const std::string& attr = i->first;
-			if(std::find_if(attr.begin(), attr.end(), util::islower) != attr.end()) {
+	if(node.is_null() == false) {
+		foreach(variant key, node.get_keys().as_list()) {
+			const std::string& attr = key.as_string();
+			if(std::find_if(attr.begin(), attr.end(), util::c_islower) != attr.end()) {
 				//only all upper case are loaded as consts
 				continue;
 			}
 
-			m[attr].serialize_from_string(i->second);
+			m[attr] = node[key];
 		}
 	}
 
 	if(constants_stack.empty() == false && constants_stack.back() == m) {
 		same_as_base_ = true;
-	} else if(constants_stack.empty() == false) {
-		std::cerr << "CONSTANTS ARE DIFFERENT: ";
-		for(constants_map::const_iterator i = m.begin(); i != m.end(); ++i) {
-			if(constants_stack.back().count(i->first) == 0) {
-				std::cerr << "NOT FOUND " << i->first << " ";
-			} else if(i->second != constants_stack.back()[i->first]) {
-				std::cerr << "DIFF " << i->first << " ";
-			}
-		}
-
-		const constants_map& m2 = constants_stack.back();
-		for(constants_map::const_iterator i = m2.begin(); i != m2.end(); ++i) {
-			if(m.count(i->first) == 0) {
-				std::cerr << "INSERTED " << i->first << " ";
-			}
-		}
-
-		std::cerr << "\n";
-	}
-
-	//std::cerr << "ADD CONSTANTS_STACK ";
-	for(constants_map::const_iterator i = m.begin(); i != m.end(); ++i) {
-		std::cerr << i->first << " ";
-	}
-
-	if(m.begin() != m.end()) {
-		std::cerr << "\n";
 	}
 
 	constants_stack.push_back(m);

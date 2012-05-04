@@ -2,6 +2,7 @@
 #define GUI_FORMULA_FUNCTIONS_HPP_INCLUDED
 
 #include "custom_object.hpp"
+#include "variant.hpp"
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/shared_ptr.hpp>
@@ -17,7 +18,7 @@ typedef boost::shared_ptr<frame> frame_ptr;
 
 class gui_algorithm : public game_logic::formula_callable {
 public:
-	gui_algorithm(wml::const_node_ptr node);
+	gui_algorithm(variant node);
 	~gui_algorithm();
 
 	static gui_algorithm_ptr get(const std::string& key);
@@ -27,6 +28,8 @@ public:
 
 	void process(level& lvl);
 	void draw(const level& lvl);
+	void load(level& lvl);
+	bool gui_event(level& lvl, const SDL_Event &event);
 
 	void draw_animation(const std::string& object_name, const std::string& anim, int x, int y, int cycle) const;
 	void color(unsigned char r, unsigned char g, unsigned char b, unsigned char a) const;
@@ -47,14 +50,19 @@ private:
 	void execute_command(variant v);
 
 	const level* lvl_;
-	game_logic::formula_ptr draw_formula_, process_formula_;
+	game_logic::formula_ptr draw_formula_, process_formula_, load_formula_;
 	int cycle_;
+	bool loaded_;
 
 	std::map<std::string, frame_ptr> frames_;
 
 	boost::intrusive_ptr<custom_object> object_;
 
 	variant cached_draw_commands_;
+
+	variant buttons_;
+	std::map<std::string, std::map<const int, game_logic::formula_ptr> > button_formulas_;
+	std::map<std::string, rect> button_hit_rects_;
 
 	std::vector<gui_algorithm_ptr> includes_;
 };

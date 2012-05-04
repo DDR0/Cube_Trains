@@ -14,3 +14,12 @@ test
 *.blend3
 *.db
 *.odt#
+.*.swp
+dirs.txt
+core
+core.*
+
+MacOS/include
+MacOS/lib
+xcuserdata
+project.xcworkspace

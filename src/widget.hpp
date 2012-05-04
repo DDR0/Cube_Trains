@@ -16,7 +16,7 @@
 #include <boost/shared_ptr.hpp>
 #include <string>
 
-#include <SDL.h>
+#include "graphics.hpp"
 #include "input.hpp"
 
 namespace gui {
@@ -37,15 +37,17 @@ public:
 	void set_tooltip(const std::string& str);
 	bool visible() { return visible_; }
 	void set_visible(bool visible) { visible_ = visible; }
+
+	virtual bool has_focus() const { return false; }
 protected:
 	widget() : x_(0), y_(0), w_(0), h_(0), tooltip_displayed_(false), visible_(true)
 	{}
 	virtual ~widget();
 
 	void normalize_event(SDL_Event* event, bool translate_coords=false);
-private:
 	virtual void handle_draw() const = 0;
 	virtual bool handle_event(const SDL_Event& event, bool claimed) { return claimed; }
+private:
 	int x_, y_;
 	int w_, h_;
 	boost::shared_ptr<std::string> tooltip_;

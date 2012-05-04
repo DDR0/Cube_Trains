@@ -15,8 +15,7 @@
 #ifndef THREAD_HPP_INCLUDED
 #define THREAD_HPP_INCLUDED
 
-#include "SDL.h"
-#include "SDL_thread.h"
+#include "graphics.hpp"
 
 #include <list>
 
@@ -53,7 +52,11 @@ public:
 	// \param data passed to f
 	//
 	// \pre f != NULL
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+	explicit thread(const std::string& name, boost::function<void ()> f);
+#else
 	explicit thread(boost::function<void ()> f);
+#endif
 
 	// Destroy the thread object. This is done by waiting on the
 	// thread with the join() operation, thus blocking until the
@@ -83,7 +86,7 @@ private:
 inline Uint32 get_current_thread_id() { return SDL_ThreadID(); }
 // Binary mutexes.
 //
-// Implements an interface to binary mutexes. This class only defines the
+// Implements an interface to mutexes. This class only defines the
 // mutex itself. Locking is handled through the friend class lock,
 // and monitor interfacing through condition variables is handled through
 // the friend class condition.
@@ -93,12 +96,16 @@ public:
 	mutex();
 	~mutex();
 
+	//we define copy constructors and assignment operators that keep the mutex
+	//intact and don't do any copying. This allows classes that contain
+	//a mutex member to have sane compiler-generated copying semantics.
+	mutex(const mutex&);
+	const mutex& operator=(const mutex&);
+
 	friend class lock;
 	friend class condition;
 
 private:
-	mutex(const mutex&);
-	void operator=(const mutex&);
 
 	SDL_mutex* const m_;
 };
@@ -118,7 +125,7 @@ public:
 	// block until the mutex lock can be acquired.
 	//
 	// \param m the mutex on which we should try to lock.
-	explicit lock(mutex& m);
+	explicit lock(const mutex& m);
 	// Delete the lock object, thus releasing the lock aquired
 	// on the mutex which the lock object was created with.
 	~lock();
@@ -126,7 +133,7 @@ private:
 	lock(const lock&);
 	void operator=(const lock&);
 
-	mutex& m_;
+	const mutex& m_;
 };
 
 // Condition variable locking.

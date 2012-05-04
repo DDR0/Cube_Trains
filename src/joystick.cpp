@@ -1,4 +1,4 @@
-#include "SDL.h"
+#include "graphics.hpp"
 
 #include <iostream>
 #include <vector>
@@ -6,6 +6,14 @@
 #include "foreach.hpp"
 #include "joystick.hpp"
 #include "preferences.hpp"
+
+#if defined(TARGET_BLACKBERRY)
+#include <bps/accelerometer.h>
+#include <bps/sensor.h>
+#include <bps/bps.h>
+#endif
+
+#include "asserts.hpp"
 
 namespace joystick {
 
@@ -16,7 +24,12 @@ const int threshold = 32700;
 }
 
 manager::manager() {
+#if defined(__ANDROID__)
+    // We're just going to open 1 joystick on android platform.
+	int n = 0; {
+#else
 	for(int n = 0; n != SDL_NumJoysticks(); ++n) {
+#endif
 		SDL_Joystick* j = SDL_JoystickOpen(n);
 		if(j) {
 			joysticks.push_back(j);
@@ -31,6 +44,10 @@ manager::~manager() {
 		SDL_JoystickClose(j);
 	}
 	joysticks.clear();
+
+#if defined(TARGET_BLACKBERRY)
+	bps_shutdown();
+#endif
 }
 
 void update() {
@@ -131,6 +148,7 @@ bool button(int n) {
 		return false;
 	}
 
+    int cnt = 0;
 	foreach(SDL_Joystick* j, joysticks) {
 		if(SDL_JoystickGetButton(j, n)) {
 			return true;
@@ -141,6 +159,18 @@ bool button(int n) {
 }
 
 int iphone_tilt() {
+
+#if defined(TARGET_BLACKBERRY)
+	double x, y, z;
+	const int result = accelerometer_read_forces(&x, &y, &z);
+	if(result != BPS_SUCCESS) {
+		std::cerr << "READ OF ACCELEROMETER FAILED\n";
+		return 0;
+	} else {
+		return x*1000;
+	}
+#endif
+
 //#if TARGET_OS_IPHONE
 //	return SDL_JoystickGetAxis(joysticks.front(), 1);
 //#else

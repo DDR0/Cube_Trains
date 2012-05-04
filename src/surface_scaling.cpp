@@ -1,16 +1,16 @@
 #include <boost/array.hpp>
-#include <inttypes.h>
+#include <boost/cstdint.hpp>
 #include <iostream>
 #include <cassert>
 
 #include "asserts.hpp"
+#include "foreach.hpp"
+#include "json_parser.hpp"
 #include "string_utils.hpp"
 #include "surface_cache.hpp"
 #include "surface.hpp"
 #include "unit_test.hpp"
-#include "wml_node.hpp"
-#include "wml_parser.hpp"
-#include "wml_utils.hpp"
+#include "variant.hpp"
 
 namespace graphics {
 
@@ -612,15 +612,15 @@ namespace {
 
 UTILITY(generate_scaling_code)
 {
-	wml::const_node_ptr node(wml::parse_wml_from_file("./surface_scaling.cfg"));
+	variant node(json::parse_from_file("./surface_scaling.cfg"));
 
 	std::vector<ScalingPattern> patterns;
-	FOREACH_WML_CHILD(pattern_node, node, "pattern") {
+	foreach(variant pattern_node, node["pattern"].as_list()) {
 		ScalingPattern pattern;
-		const std::string& pattern_str = pattern_node->attr("pattern");
+		const std::string& pattern_str = pattern_node["pattern"].as_string();
 		int n = 0;
 		foreach(char c, pattern_str) {
-			if(!util::isspace(c)) {
+			if(!util::c_isspace(c)) {
 				ASSERT_LOG(n < pattern.input.size(), "SURFACE SCALING PATTERN HAS TOO MANY CHARACTERS: " << pattern_str);
 				pattern.input[n++] = c;
 			}
@@ -628,12 +628,12 @@ UTILITY(generate_scaling_code)
 
 		ASSERT_LOG(n == 25, "SURFACE SCALING_PATTERN HAS TOO FEW CHARACTERS: " << pattern_str);
 
-		FOREACH_WML_CHILD(output_node, pattern_node, "output") {
+		foreach(variant output_node, pattern_node["output"].as_list()) {
 			ScalingOutput output;
-			const std::string& input_str = output_node->attr("input");
+			const std::string& input_str = output_node["input"].as_string();
 			int n = 0;
 			foreach(char c, input_str) {
-				if(!util::isspace(c)) {
+				if(!util::c_isspace(c)) {
 					ASSERT_LOG(n < output.input.size(), "SURFACE SCALING INPUT HAS TOO MANY CHARACTERS: " << input_str);
 					output.input[n++] = c;
 				}
@@ -641,10 +641,10 @@ UTILITY(generate_scaling_code)
 
 			ASSERT_LOG(n == 25, "SURFACE SCALING INPUT HAS TOO FEW CHARACTERS: " << input_str);
 
-			const std::string& output_str = output_node->attr("output");
+			const std::string& output_str = output_node["output"].as_string();
 			n = 0;
 			foreach(char c, output_str) {
-				if(!util::isspace(c)) {
+				if(!util::c_isspace(c)) {
 					ASSERT_LOG(n < output.output.size(), "SURFACE SCALING OUTPUT HAS TOO MANY CHARACTERS: " << output_str);
 					output.output[n++] = c;
 				}
@@ -683,7 +683,7 @@ UTILITY(generate_scaling_code)
 			std::cout << "\t{\n\tPixelUnion pu;\n\tint red = 0, green = 0, blue = 0, count = 0;\n";
 			int value_count = 0;
 			for(int n = 0; n != output.input.size(); ++n) {
-				if(util::isdigit(output.input[n]) && output.input[n] != '0') {
+				if(util::c_isdigit(output.input[n]) && output.input[n] != '0') {
 					const int value = output.input[n] - '0';
 					value_count += value;
 					std::cout << "\tpu.value = matrix[" << n << "];\n";

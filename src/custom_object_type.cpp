@@ -3,26 +3,32 @@
 
 #include "asserts.hpp"
 #include "collision_utils.hpp"
+#include "custom_object.hpp"
 #include "custom_object_callable.hpp"
 #include "custom_object_functions.hpp"
 #include "custom_object_type.hpp"
 #include "filesystem.hpp"
 #include "formula_constants.hpp"
+#include "json_parser.hpp"
+#include "level.hpp"
+#include "load_level.hpp"
+#include "module.hpp"
 #include "object_events.hpp"
 #include "preferences.hpp"
 #include "solid_map.hpp"
 #include "sound.hpp"
 #include "string_utils.hpp"
 #include "surface_cache.hpp"
-#include "wml_modify.hpp"
-#include "wml_node.hpp"
-#include "wml_parser.hpp"
-#include "wml_schema.hpp"
-#include "wml_utils.hpp"
-#include "wml_writer.hpp"
 #include "unit_test.hpp"
+#include "variant_callable.hpp"
+#include "variant_utils.hpp"
 
 namespace {
+std::map<std::string, int64_t>& file_mod_times() {
+	static std::map<std::string, int64_t> mod_times;
+	return mod_times;
+}
+
 std::map<std::string, std::string>& object_file_paths() {
 	static std::map<std::string, std::string> paths;
 	return paths;
@@ -35,11 +41,27 @@ std::map<std::string, std::string>& prototype_file_paths() {
 
 const std::string& object_file_path() {
 	if(preferences::load_compiled()) {
-		static const std::string value =  "data/compiled/objects/";
+		static const std::string value =  "data/compiled/objects";
 		return value;
 	} else {
-		static const std::string value =  "data/objects/";
+		static const std::string value =  "data/objects";
 		return value;
+	}
+}
+
+void load_file_paths() {
+
+	//find out the paths to all our files
+	module::get_unique_filenames_under_dir(object_file_path(), &object_file_paths());
+	module::get_unique_filenames_under_dir("data/object_prototypes", &prototype_file_paths());
+
+	for(std::map<std::string, std::string>::const_iterator i = object_file_paths().begin(); i != object_file_paths().end(); ++i) {
+		file_mod_times()[i->second] = sys::file_mod_time("./" + i->second);
+		//std::cerr << "FILE MOD TIME FOR " << i->second << ": " << file_mod_times()[i->second] << "\n";
+	}
+
+	for(std::map<std::string, std::string>::const_iterator i = prototype_file_paths().begin(); i != prototype_file_paths().end(); ++i) {
+		file_mod_times()[i->second] = sys::file_mod_time(i->second);
 	}
 }
 
@@ -54,35 +76,9 @@ namespace {
 const std::string BaseStr = "%PROTO%";
 }
 
-void merge_into_prototype(wml::node_ptr prototype_node, wml::node_ptr node)
+variant merge_into_prototype(variant prototype_node, variant node)
 {
-	for(std::map<std::string, wml::const_node_ptr>::const_iterator i = node->base_elements().begin(); i != node->base_elements().end(); ++i) {
-		prototype_node->set_base_element(i->first, i->second);
-	}
-
-	//we have a prototype node and an object node. We want to merge
-	//them together to give one object definition. We will save
-	//the final definition in the prototype_node, overwriting its
-	//values with changes from the object node.
-	//begin by setting attributes in the prototype node from
-	//the object node.
-	for(wml::node::const_attr_iterator i = node->begin_attr();
-	    i != node->end_attr(); ++i) {
-		std::string::const_iterator base_itor = std::search(i->second.str().begin(), i->second.str().end(), BaseStr.begin(), BaseStr.end());
-		if(base_itor != i->second.str().end()) {
-			std::string base_attr = prototype_node->attr(i->first);
-			if(base_attr.empty()) {
-				base_attr = "null()";
-			}
-			
-			std::string value = std::string(i->second.str().begin(), base_itor) + base_attr + std::string(base_itor + BaseStr.size(), i->second.str().end());
-
-			wml::value val(value, i->second.filename(), i->second.line());
-			prototype_node->set_attr(i->first, val);
-		} else {
-			prototype_node->set_attr(i->first, i->second);
-		}
-	}
+	std::map<variant, variant> result;
 
 	//mapping of animation nodes is kinda complicated: in the
 	//prototype there can be one specification of each animation.
@@ -93,86 +89,157 @@ void merge_into_prototype(wml::node_ptr prototype_node, wml::node_ptr node)
 	//We are going to build a completely fresh/new set of animations
 	//in a vector, and then wipe out all current animations and
 	//replace with these from the vector.
-	std::vector<wml::node_ptr> animation_nodes;
+	std::vector<variant> animations;
+	std::set<std::string> animations_seen;
+	foreach(variant anim, node["animation"].as_list()) {
+		variant id = anim["id"];
+		animations_seen.insert(id.as_string());
+		variant proto_anim;
+		foreach(variant candidate, prototype_node["animation"].as_list()) {
+			if(candidate["id"] == id) {
+				proto_anim = candidate;
+				break;
+			}
+		}
 
-	//go over every animation in the object, and see if the animation
-	//is also defined in the prototype.
-	FOREACH_WML_CHILD(anim_node, node, "animation") {
-		wml::node_ptr target_anim = wml::find_child_by_attribute(prototype_node, "animation", "id", anim_node->attr("id"));
-		if(target_anim) {
+		if(proto_anim.is_map()) {
 			//the animation is in the prototype, so we merge the
 			//object's definition of the animation with the
 			//prototype's.
-			wml::node_ptr new_node(wml::deep_copy(target_anim));
-			wml::merge_over(anim_node, new_node);
-			animation_nodes.push_back(new_node);
+			animations.push_back(proto_anim + anim);
 		} else {
 			//the animation isn't in the prototype, so just add
 			//what is given in the object.
-			animation_nodes.push_back(wml::deep_copy(anim_node));
+			animations.push_back(anim);
 		}
 	}
 
 	//now go over the prototype node and add any animations that don't
 	//appear in the child.
-	FOREACH_WML_CHILD(anim_node, prototype_node, "animation") {
-		if(wml::find_child_by_attribute(node, "animation", "id", anim_node->attr("id"))) {
-			//it's already in the child, so don't add it.
+	foreach(variant anim, prototype_node["animation"].as_list()) {
+		if(animations_seen.count(anim["id"].as_string()) == 0) {
+			animations.push_back(anim);
+		}
+	}
+
+	foreach(variant key, prototype_node.get_keys().as_list()) {
+		result[key] = prototype_node[key];
+	}
+
+	foreach(variant key, node.get_keys().as_list()) {
+		variant proto_value = result[key];
+		variant value = node[key];
+
+		if(value.is_null()) {
+			//An explicit null in the object will kill the
+			//attribute entirely.
+			result[key] = variant();
 			continue;
 		}
 
-		animation_nodes.push_back(wml::deep_copy(anim_node));
-	}
-
-	prototype_node->clear_children("animation");
-	foreach(wml::node_ptr node, animation_nodes) {
-		prototype_node->add_child(node);
-	}
-
-	//now go over every element and copy them in.
-	for(wml::node::all_child_iterator i = node->begin_children();
-	    i != node->end_children(); ++i) {
-		const std::string& name = (*i)->name();
-		if(name == "animation") {
-			//we handled animations above, so ignore this here.
-			continue;
-		}
-
-		if(name == "tmp" || name == "vars" || name == "consts" || name == "editor_info") {
-			//we like to merge in vars nodes into one vars definition
-			//if both the object and prototype have vars definitions.
-			wml::node_ptr target = prototype_node->get_child(name);
-			if(target) {
-				wml::merge_over(*i, target);
-				continue;
+		if(key.as_string().size() > 3 && std::equal(key.as_string().begin(), key.as_string().begin() + 3, "on_")) {
+			if(proto_value.is_string()) {
+				std::string k = key.as_string();
+				const std::string proto_event_key = "on_" + prototype_node["id"].as_string() + "_PROTO_" + std::string(k.begin() + 3, k.end());
+				result[variant(proto_event_key)] = proto_value;
 			}
 		}
 
-		prototype_node->add_child(*i);
+		if(value.is_string()) {
+			const std::string& value_str = value.as_string();
+			std::string::const_iterator base_itor = std::search(value_str.begin(), value_str.end(), BaseStr.begin(), BaseStr.end());
+			if(base_itor != value_str.end()) {
+				const variant::debug_info* info = value.get_debug_info();
+				std::string base_value = "null";
+				if(proto_value.is_string()) {
+					base_value = proto_value.as_string();
+				}
+				const std::string s = std::string(value_str.begin(), base_itor) + base_value + std::string(base_itor + BaseStr.size(), value_str.end());
+				value = variant(s);
+				proto_value = variant();
+
+				if(info) {
+					value.set_debug_info(*info);
+				}
+			}
+		}
+
+		result[key] = append_variants(proto_value, value);
 	}
+
+	std::vector<variant> functions;
+	variant proto_fn = prototype_node["functions"];
+	if(proto_fn.is_string()) {
+		functions.push_back(proto_fn);
+	} else if(proto_fn.is_list()) {
+		foreach(variant v, proto_fn.as_list()) {
+			functions.push_back(v);
+		}
+	}
+
+	variant fn = node["functions"];
+	if(fn.is_string()) {
+		functions.push_back(fn);
+	} else if(fn.is_list()) {
+		foreach(variant v, fn.as_list()) {
+			functions.push_back(v);
+		}
+	}
+
+	if(!functions.empty()) {
+		result[variant("functions")] = variant(&functions);
+	}
+
+	result[variant("animation")] = variant(&animations);
+
+	//any objects which are explicitly merged.
+	result[variant("tmp")] = prototype_node["tmp"] + node["tmp"];
+	result[variant("vars")] = prototype_node["vars"] + node["vars"];
+	result[variant("consts")] = prototype_node["consts"] + node["consts"];
+	result[variant("variations")] = prototype_node["variations"] + node["variations"];
+	result[variant("editor_info")] = prototype_node["editor_info"] + node["editor_info"];
+	variant proto_properties = prototype_node["properties"];
+	variant node_properties = node["properties"];
+	variant properties = proto_properties + node_properties;
+	if(proto_properties.is_map() && node_properties.is_map()) {
+		foreach(const variant_pair& p, proto_properties.as_map()) {
+			if(node_properties.has_key(p.first)) {
+				const std::string proto_id = prototype_node["id"].as_string() + "_" + p.first.as_string();
+				properties.add_attr(variant(proto_id), p.second);
+			}
+		}
+	}
+	result[variant("properties")] = properties;
+
+	variant res(&result);
+	if(node.get_debug_info()) {
+		res.set_debug_info(*node.get_debug_info());
+	}
+
+	return res;
 }
 
 }
 
 //function which finds if a node has a prototype, and if so, applies the
 //prototype to the node.
-wml::node_ptr custom_object_type::merge_prototype(wml::node_ptr node)
+variant custom_object_type::merge_prototype(variant node)
 {
-	if(!node->has_attr("prototype")) {
+	if(!node.has_key("prototype")) {
 		return node;
 	}
 
-	std::vector<std::string> protos = util::split(node->attr("prototype"));
+	std::vector<std::string> protos = node["prototype"].as_list_string();
 
 	foreach(const std::string& proto, protos) {
 		//look up the object's prototype and merge it in
 		std::map<std::string, std::string>::const_iterator path_itor = prototype_file_paths().find(proto + ".cfg");
-		ASSERT_LOG(path_itor != prototype_file_paths().end(), "Could not find file for prototype '" << node->attr("prototype") << "'");
+		ASSERT_LOG(path_itor != prototype_file_paths().end(), "Could not find file for prototype '" << proto << "'");
 
-		wml::node_ptr prototype_node = wml::parse_wml_from_file(path_itor->second);
+		variant prototype_node = json::parse_from_file(path_itor->second);
+		ASSERT_LOG(prototype_node["id"].as_string() == proto, "PROTOTYPE NODE FOR " << proto << " DOES NOT SPECIFY AN ACCURATE id FIELD");
 		prototype_node = merge_prototype(prototype_node);
-		merge_into_prototype(prototype_node, node);
-		node = prototype_node;
+		node = merge_into_prototype(prototype_node, node);
 	}
 	return node;
 }
@@ -180,9 +247,7 @@ wml::node_ptr custom_object_type::merge_prototype(wml::node_ptr node)
 const std::string* custom_object_type::get_object_path(const std::string& id)
 {
 	if(object_file_paths().empty()) {
-		//find out the paths to all our files
-		sys::get_unique_filenames_under_dir(object_file_path(), &object_file_paths());
-		sys::get_unique_filenames_under_dir("data/object_prototypes", &prototype_file_paths());
+		load_file_paths();
 	}
 
 	std::map<std::string, std::string>::const_iterator itor = object_file_paths().find(id);
@@ -213,6 +278,10 @@ const_custom_object_type_ptr custom_object_type::get(const std::string& id)
 	const_custom_object_type_ptr result(create(id));
 	cache()[id] = result;
 
+	//load the object's variations here to avoid pausing the game
+	//when an object starts its variation.
+	result->load_variations();
+
 	return result;
 }
 
@@ -236,10 +305,14 @@ const_custom_object_type_ptr custom_object_type::get_sub_object(const std::strin
 
 custom_object_type_ptr custom_object_type::create(const std::string& id)
 {
+	return recreate(id, NULL);
+}
+
+custom_object_type_ptr custom_object_type::recreate(const std::string& id,
+                                             const custom_object_type* old_type)
+{
 	if(object_file_paths().empty()) {
-		//find out the paths to all our files
-		sys::get_unique_filenames_under_dir(object_file_path(), &object_file_paths());
-		sys::get_unique_filenames_under_dir("data/object_prototypes", &prototype_file_paths());
+		load_file_paths();
 	}
 
 	//find the file for the object we are loading.
@@ -247,32 +320,18 @@ custom_object_type_ptr custom_object_type::create(const std::string& id)
 	ASSERT_LOG(path_itor != object_file_paths().end(), "Could not find file for object '" << id << "'");
 
 	try {
-		wml::node_ptr node = wml::parse_wml_from_file(path_itor->second);
+		variant node = merge_prototype(json::parse_from_file(path_itor->second));
 
-		node = merge_prototype(node);
+		ASSERT_LOG(node["id"].as_string() == id, "IN " << path_itor->second << " OBJECT ID DOES NOT MATCH FILENAME");
 
-		ASSERT_LOG(node->attr("id").str() == id, "IN " << path_itor->second << " OBJECT ID DOES NOT MATCH FILENAME");
+		//create the object
+		custom_object_type_ptr result(new custom_object_type(node, NULL, old_type));
 
-		static const wml::schema* schema = wml::schema::get("custom_object");
-		if(schema) {
-			schema->validate_node(node);
-		}
-
-		//create the object and add it to our cache.
-		custom_object_type_ptr result(new custom_object_type(node));
-
-		//load the object's variations here to avoid pausing the game
-		//when an object starts its variation.
-		result->load_variations();
 		return result;
-	} catch(wml::parse_error& e) {
-		ASSERT_LOG(false, "Error parsing WML for custom object in " << path_itor->second << ": " << e.message);
-	} catch(wml::schema_error& e) {
-		ASSERT_LOG(false, "Error loading object '" << id << "': " << e.message);
+	} catch(json::parse_error& e) {
+		ASSERT_LOG(false, "Error parsing WML for custom object in " << path_itor->second << ": " << e.error_message());
 	} catch(graphics::load_image_error&) {
 		ASSERT_LOG(false, "Error loading object '" << id << "': could not load needed image");
-	} catch(...) {
-		ASSERT_LOG(false, "Unknown error loading custom object in " << path_itor->second);
 	}
 }
 
@@ -292,7 +351,7 @@ std::vector<const_custom_object_type_ptr> custom_object_type::get_all()
 {
 	std::vector<const_custom_object_type_ptr> res;
 	std::map<std::string, std::string> file_paths;
-	sys::get_unique_filenames_under_dir(object_file_path(), &file_paths);
+	module::get_unique_filenames_under_dir(object_file_path(), &file_paths);
 	for(std::map<std::string, std::string>::const_iterator i = file_paths.begin(); i != file_paths.end(); ++i) {
 		const std::string& fname = i->first;
 		if(fname.size() < 4 || std::string(fname.end()-4, fname.end()) != ".cfg") {
@@ -306,8 +365,106 @@ std::vector<const_custom_object_type_ptr> custom_object_type::get_all()
 	return res;
 }
 
+int custom_object_type::reload_modified_code()
+{
+	int result = 0;
+	for(object_map::iterator i = cache().begin(); i != cache().end(); ++i) {
+		const std::string* path = get_object_path(i->first + ".cfg");
+		if(!path) {
+			continue;
+		}
 
-void custom_object_type::init_event_handlers(wml::const_node_ptr node,
+		std::map<std::string, int64_t>::iterator mod_itor = file_mod_times().find(*path);
+		const int64_t mod_time = sys::file_mod_time(*path);
+		if(mod_time != 0 && mod_itor != file_mod_times().end() && mod_time != mod_itor->second) {
+			mod_itor->second = mod_time;
+			std::cerr << "FILE MODIFIED: " << i->first << " -> " << *path << ": " << mod_time << " VS " << mod_itor->second << "\n";
+
+			if(reload_object(i->first)) {
+				++result;
+			}
+		}
+	}
+
+	return result;
+}
+
+bool custom_object_type::set_file_contents(const std::string& file_path, const std::string& contents)
+{
+	json::set_file_contents(file_path, contents);
+	for(object_map::iterator i = cache().begin(); i != cache().end(); ++i) {
+		const std::string* path = get_object_path(i->first + ".cfg");
+		if(path && *path == file_path) {
+			if(!reload_object(i->first)) {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+namespace {
+int g_num_object_reloads = 0;
+}
+
+bool custom_object_type::reload_object(const std::string& type)
+{
+	object_map::iterator itor = cache().find(type);
+	ASSERT_LOG(itor != cache().end(), "COULD NOT RELOAD OBJECT " << type);
+	
+	const_custom_object_type_ptr old_obj = itor->second;
+
+	custom_object_type_ptr new_obj;
+	
+	const int begin = SDL_GetTicks();
+	try {
+		const assert_recover_scope scope;
+		new_obj = recreate(type, old_obj.get());
+		std::cerr << "RELOADED OBJECT IN " << (SDL_GetTicks() - begin) << "ms\n";
+	} catch(validation_failure_exception& e) {
+		std::cerr << "FAILURE TO LOAD IN " << (SDL_GetTicks() - begin) << "ms\n";
+		return false;
+	} catch(...) {
+		std::cerr << "UNKNOWN FAILURE TO LOAD IN " << (SDL_GetTicks() - begin) << "ms\n";
+		return false;
+	}
+
+
+	if(new_obj) {
+		const int start = SDL_GetTicks();
+		foreach(custom_object* obj, custom_object::get_all(old_obj->id())) {
+			obj->update_type(old_obj, new_obj);
+		}
+
+		for(std::map<std::string, const_custom_object_type_ptr>::const_iterator i = old_obj->sub_objects_.begin(); i != old_obj->sub_objects_.end(); ++i) {
+			std::map<std::string, const_custom_object_type_ptr>::const_iterator j = new_obj->sub_objects_.find(i->first);
+			if(j != new_obj->sub_objects_.end() && i->second != j->second) {
+				foreach(custom_object* obj, custom_object::get_all(i->second->id())) {
+					obj->update_type(i->second, j->second);
+				}
+			}
+		}
+
+		const int end = SDL_GetTicks();
+		std::cerr << "UPDATED " << custom_object::get_all(old_obj->id()).size() << " OBJECTS IN " << (end - start) << "ms\n";
+
+		itor->second = new_obj;
+
+		++g_num_object_reloads;
+
+		return true;
+	}
+
+	return false;
+}
+
+int custom_object_type::num_object_reloads()
+{
+	return g_num_object_reloads;
+}
+
+void custom_object_type::init_event_handlers(variant node,
                                              event_handler_map& handlers,
 											 game_logic::function_symbol_table* symbols,
 											 const event_handler_map* base_handlers)
@@ -318,75 +475,82 @@ void custom_object_type::init_event_handlers(wml::const_node_ptr node,
 
 	static custom_object_callable custom_object_definition;
 
-	for(wml::node::const_attr_iterator i = node->begin_attr(); i != node->end_attr(); ++i) {
-		if(i->first.size() > 3 && std::equal(i->first.begin(), i->first.begin() + 3, "on_")) {
-			const std::string event(i->first.begin() + 3, i->first.end());
+	foreach(const variant_pair& value, node.as_map()) {
+		const std::string& key = value.first.as_string();
+		if(key.size() > 3 && std::equal(key.begin(), key.begin() + 3, "on_")) {
+			const std::string event(key.begin() + 3, key.end());
 			const int event_id = get_object_event_id(event);
 			if(handlers.size() <= event_id) {
 				handlers.resize(event_id+1);
 			}
 
-			if(base_handlers && base_handlers->size() > event_id && (*base_handlers)[event_id] && (*base_handlers)[event_id]->str() == i->second.str()) {
+			if(base_handlers && base_handlers->size() > event_id && (*base_handlers)[event_id] && (*base_handlers)[event_id]->str() == value.second.as_string()) {
 				handlers[event_id] = (*base_handlers)[event_id];
 			} else {
-				handlers[event_id] = game_logic::formula::create_optional_formula(i->second, symbols, &custom_object_definition);
+				handlers[event_id] = game_logic::formula::create_optional_formula(value.second, symbols, &custom_object_definition);
 			}
 		}
 	}
 }
 
-
-custom_object_type::custom_object_type(wml::const_node_ptr node, const custom_object_type* base_type)
-  : id_(node->attr("id")),
-	hitpoints_(wml::get_int(node, "hitpoints", 1)),
-	timer_frequency_(wml::get_int(node, "timer_frequency", -1)),
-	zorder_(wml::get_int(node, "zorder")),
-	zsub_order_(wml::get_int(node, "zsub_order")),
-	is_human_(wml::get_bool(node, "is_human", false)),
-	goes_inactive_only_when_standing_(wml::get_bool(node, "goes_inactive_only_when_standing", false)),
-	dies_on_inactive_(wml::get_bool(node, "dies_on_inactive", false)),
-	always_active_(wml::get_bool(node, "always_active", false)),
-    body_harmful_(wml::get_bool(node, "body_harmful", true)),
-    body_passthrough_(wml::get_bool(node, "body_passthrough", false)),
-    ignore_collide_(wml::get_bool(node, "ignore_collide", false)),
-    object_level_collisions_(wml::get_bool(node, "object_level_collisions", false)),
-	surface_friction_(wml::get_int(node, "surface_friction", 100)),
-	surface_traction_(wml::get_int(node, "surface_traction", 100)),
-	friction_(wml::get_int(node, "friction")),
-	traction_(wml::get_int(node, "traction", 1000)),
-	traction_in_air_(wml::get_int(node, "traction_in_air", 0)),
-	traction_in_water_(wml::get_int(node, "traction_in_water", 0)),
-	respawns_(wml::get_bool(node, "respawns", true)),
-	affected_by_currents_(wml::get_bool(node, "affected_by_currents", false)),
-	is_vehicle_(wml::get_bool(node, "vehicle", false)),	
-	passenger_x_(wml::get_int(node, "passenger_x")),
-	passenger_y_(wml::get_int(node, "passenger_y")),
-	feet_width_(wml::get_int(node, "feet_width", 0)),
-	use_image_for_collisions_(wml::get_bool(node, "use_image_for_collisions", false)),
-	has_feet_(wml::get_bool(node, "has_feet", true) && use_image_for_collisions_ == false),
-	adjust_feet_on_animation_change_(wml::get_bool(node, "adjust_feet_on_animation_change", true)),
-	teleport_offset_x_(wml::get_int(node, "teleport_offset_x")),
-	teleport_offset_y_(wml::get_int(node, "teleport_offset_y")),
-	no_move_to_standing_(wml::get_bool(node, "no_move_to_standing")),
-	reverse_global_vertical_zordering_(wml::get_bool(node, "reverse_global_vertical_zordering", false)),
-	serializable_(wml::get_bool(node, "serializable", true)),
+custom_object_type::custom_object_type(variant node, const custom_object_type* base_type, const custom_object_type* old_type)
+  : id_(node["id"].as_string()),
+	hitpoints_(node["hitpoints"].as_int(1)),
+	timer_frequency_(node["timer_frequency"].as_int(-1)),
+	zorder_(node["zorder"].as_int()),
+	zsub_order_(node["zsub_order"].as_int()),
+	is_human_(node["is_human"].as_bool(false)),
+	goes_inactive_only_when_standing_(node["goes_inactive_only_when_standing"].as_bool(false)),
+	dies_on_inactive_(node["dies_on_inactive"].as_bool(false)),
+	always_active_(node["always_active"].as_bool(false)),
+    body_harmful_(node["body_harmful"].as_bool(true)),
+    body_passthrough_(node["body_passthrough"].as_bool(false)),
+    ignore_collide_(node["ignore_collide"].as_bool(false)),
+    object_level_collisions_(node["object_level_collisions"].as_bool(false)),
+	surface_friction_(node["surface_friction"].as_int(100)),
+	surface_traction_(node["surface_traction"].as_int(100)),
+	friction_(node["friction"].as_int()),
+	traction_(node["traction"].as_int(1000)),
+	traction_in_air_(node["traction_in_air"].as_int(0)),
+	traction_in_water_(node["traction_in_water"].as_int(0)),
+	respawns_(node["respawns"].as_bool(true)),
+	affected_by_currents_(node["affected_by_currents"].as_bool(false)),
+	is_vehicle_(node["vehicle"].as_bool(false)),	
+	passenger_x_(node["passenger_x"].as_int()),
+	passenger_y_(node["passenger_y"].as_int()),
+	feet_width_(node["feet_width"].as_int(0)),
+	use_image_for_collisions_(node["use_image_for_collisions"].as_bool(false)),
+	static_object_(node["static_object"].as_bool(use_image_for_collisions_)),
+	has_feet_(node["has_feet"].as_bool(true) && static_object_ == false),
+	adjust_feet_on_animation_change_(node["adjust_feet_on_animation_change"].as_bool(true)),
+	teleport_offset_x_(node["teleport_offset_x"].as_int()),
+	teleport_offset_y_(node["teleport_offset_y"].as_int()),
+	no_move_to_standing_(node["no_move_to_standing"].as_bool()),
+	reverse_global_vertical_zordering_(node["reverse_global_vertical_zordering"].as_bool(false)),
+	serializable_(node["serializable"].as_bool(true)),
 	solid_(solid_info::create(node)),
 	platform_(solid_info::create_platform(node)),
+	solid_platform_(node["solid_platform"].as_bool(false)),
 	has_solid_(solid_ || use_image_for_collisions_),
 	solid_dimensions_(has_solid_ || platform_ ? 0xFFFFFFFF : 0),
 	collide_dimensions_(0xFFFFFFFF),
-	weak_solid_dimensions_(has_solid_ || platform_ ? 0xFFFFFFFF : 0),
+	weak_solid_dimensions_(has_solid_ || platform_ || node["has_platform"].as_bool(false) ? 0xFFFFFFFF : 0),
 	weak_collide_dimensions_(0xFFFFFFFF),
-	activation_border_(wml::get_int(node, "activation_border", 100))
+	activation_border_(node["activation_border"].as_int(100)),
+	editor_force_standing_(node["editor_force_standing"].as_bool(false)),
+	hidden_in_game_(node["hidden_in_game"].as_bool(false)),
+	platform_offsets_(node["platform_offsets"].as_list_int_optional())
 {
-	if(node->get_child("editor_info")) {
-		editor_info_.reset(new editor_entity_info(node->get_child("editor_info")));
+#ifndef NO_EDITOR
+	if(node.has_key("editor_info")) {
+		editor_info_.reset(new editor_entity_info(node["editor_info"]));
 	}
+#endif // !NO_EDITOR
 
-	if(node->has_attr("preload_sounds")) {
+	if(node.has_key("preload_sounds")) {
 		//Pre-load any sounds that should be present when we create
 		//this object type.
-		foreach(std::string sound, util::split(node->attr("preload_sounds"))) {
+		foreach(std::string sound, util::split(node["preload_sounds"].as_string())) {
 			sound::preload(sound);
 		}
 	}
@@ -394,7 +558,7 @@ custom_object_type::custom_object_type(wml::const_node_ptr node, const custom_ob
 	const bool is_variation = base_type != NULL;
 
 	//make it so any formula has these constants defined.
-	const game_logic::constants_loader scope_consts(node->get_child("consts"));
+	const game_logic::constants_loader scope_consts(node["consts"]);
 
 	//if some constants change from base to variation, then we have to
 	//re-parse all formulas.
@@ -402,44 +566,38 @@ custom_object_type::custom_object_type(wml::const_node_ptr node, const custom_ob
 		base_type = NULL;
 	}
 
-	if(node->has_attr("solid_dimensions")) {
+	if(node.has_key("solid_dimensions")) {
 		weak_solid_dimensions_ = solid_dimensions_ = 0;
-		foreach(std::string key, util::split(node->attr("solid_dimensions"))) {
-			if(key != "level_only") {
-				if(key.empty() == false && key[0] == '~') {
-					key = std::string(key.begin()+1, key.end());
-					weak_solid_dimensions_ |= (1 << get_solid_dimension_id(key));
-				} else {
-					solid_dimensions_ |= (1 << get_solid_dimension_id(key));
-				}
+		foreach(std::string key, node["solid_dimensions"].as_list_string()) {
+			if(key.empty() == false && key[0] == '~') {
+				key = std::string(key.begin()+1, key.end());
+				weak_solid_dimensions_ |= (1 << get_solid_dimension_id(key));
+			} else {
+				solid_dimensions_ |= (1 << get_solid_dimension_id(key));
 			}
 		}
 
 		weak_solid_dimensions_ |= solid_dimensions_;
 	}
 
-	if(node->has_attr("collide_dimensions")) {
+	if(node.has_key("collide_dimensions")) {
 		weak_collide_dimensions_ = collide_dimensions_ = 0;
-		foreach(std::string key, util::split(node->attr("collide_dimensions"))) {
-			if(key != "level_only") {
-				if(key.empty() == false && key[0] == '~') {
-					key = std::string(key.begin()+1, key.end());
-					weak_collide_dimensions_ |= (1 << get_solid_dimension_id(key));
-				} else {
-					collide_dimensions_ |= (1 << get_solid_dimension_id(key));
-				}
+		foreach(std::string key, node["collide_dimensions"].as_list_string()) {
+			if(key.empty() == false && key[0] == '~') {
+				key = std::string(key.begin()+1, key.end());
+				weak_collide_dimensions_ |= (1 << get_solid_dimension_id(key));
+			} else {
+				collide_dimensions_ |= (1 << get_solid_dimension_id(key));
 			}
 		}
 
 		weak_collide_dimensions_ |= collide_dimensions_;
 	}
 
-	wml::node::const_child_iterator a1 = node->begin_child("animation");
-	wml::node::const_child_iterator a2 = node->end_child("animation");
-	for(; a1 != a2; ++a1) {
+	foreach(variant anim, node["animation"].as_list()) {
 		boost::shared_ptr<frame> f;
 		try {
-			f.reset(new frame(a1->second));
+			f.reset(new frame(anim));
 		} catch(frame::error&) {
 			ASSERT_LOG(false, "ERROR LOADING FRAME IN OBJECT '" << id_ << "'");
 		}
@@ -452,17 +610,19 @@ custom_object_type::custom_object_type(wml::const_node_ptr node, const custom_ob
 			has_solid_ = true;
 		}
 
-		frames_[a1->second->attr("id")].push_back(f);
-		const int duplicates = atoi(a1->second->attr("duplicates").c_str());
+		frames_[anim["id"].as_string()].push_back(f);
+		const int duplicates = anim["duplicates"].as_int();
 		if(duplicates > 1) {
 			for(int n = 1; n != duplicates; ++n) {
-				frames_[a1->second->attr("id")].push_back(f);
+				frames_[anim["id"].as_string()].push_back(f);
 			}
 		}
 		if(!default_frame_) {
 			default_frame_ = f;
 		}
 	}
+
+	ASSERT_LOG(default_frame_, "OBJECT " << id_ << " NO ANIMATIONS FOR OBJECT: " << node.write_json() << "'");
 
 	std::vector<variant> available_frames;
 	for(frame_map::const_iterator i = frames_.begin(); i != frames_.end(); ++i) {
@@ -471,96 +631,114 @@ custom_object_type::custom_object_type(wml::const_node_ptr node, const custom_ob
 
 	available_frames_ = variant(&available_frames);
 
-	mass_ = wml::get_int(node, "mass", (default_frame_->collide_w() * default_frame_->collide_h() ) );
+	mass_ = node["mass"].as_int(default_frame_->collide_w() * default_frame_->collide_h());
 	
-	wml::node::const_child_iterator c1 = node->begin_child("child");
-	wml::node::const_child_iterator c2 = node->end_child("child");
-	for(; c1 != c2; ++c1) {
-		const std::string& child_id = c1->second->attr("child_id");
-		children_[child_id] = c1->second;
+	foreach(variant child, node["child"].as_list()) {
+		const std::string& child_id = child["child_id"].as_string();
+		children_[child_id] = child;
 	}
 
 	assert(default_frame_);
 
-	next_animation_formula_ = game_logic::formula::create_optional_formula(node->attr("next_animation"), function_symbols());
+	next_animation_formula_ = game_logic::formula::create_optional_formula(node["next_animation"], function_symbols());
 
-	FOREACH_WML_CHILD(particle_node, node, "particle_system") {
-		particle_factories_[particle_node->attr("id")] = particle_system_factory::create_factory(particle_node);
+	foreach(variant particle_node, node["particle_system"].as_list()) {
+		particle_factories_[particle_node["id"].as_string()] = particle_system_factory::create_factory(particle_node);
 	}
 
 	if(!is_variation) {
-		FOREACH_WML_CHILD(object_node, node, "object_type") {
-			wml::node_ptr dup_object_node = wml::deep_copy(object_node);
-			custom_object_type* type = new custom_object_type(merge_prototype(dup_object_node));
-			type->id_ = id_ + "." + type->id_;
-			sub_objects_[object_node->attr("id")].reset(type);
+		foreach(variant object_node, node["object_type"].as_list()) {
+			variant merged = merge_prototype(object_node);
+			std::string sub_key = object_node["id"].as_string();
+
+			if(old_type && old_type->sub_objects_.count(sub_key) &&
+			   old_type->sub_objects_.find(sub_key)->second->node_ == merged) {
+				//We are recreating this object, and the sub object node
+				//hasn't changed at all, so just reuse the same sub object.
+				sub_objects_[sub_key] = old_type->sub_objects_.find(sub_key)->second;
+			} else {
+				custom_object_type* type = new custom_object_type(merged);
+				type->id_ = id_ + "." + type->id_;
+				if(old_type && type->node_.is_null()){
+					type->node_ = merged;
+				}
+			//std::cerr << "MERGED PROTOTYPE FOR " << type->id_ << ": " << merged.write_json() << "\n";
+				sub_objects_[sub_key].reset(type);
+			}
 		}
 	}
 
-	if(node->has_attr("parallax_scale_x") || node->has_attr("parallax_scale_y")) {
-		parallax_scale_millis_.reset(new std::pair<int, int>(wml::get_int(node, "parallax_scale_x", 1000), wml::get_int(node, "parallax_scale_y", 1000)));
+	if(node.has_key("parallax_scale_x") || node.has_key("parallax_scale_y")) {
+		parallax_scale_millis_.reset(new std::pair<int, int>(node["parallax_scale_x"].as_int(1000), node["parallax_scale_y"].as_int(1000)));
 	}
 	
-	wml::const_node_ptr vars = node->get_child("vars");
-	if(vars) {
+	variant vars = node["vars"];
+	if(vars.is_null() == false) {
 		std::vector<std::string> var_str;
-		for(wml::node::const_attr_iterator v = vars->begin_attr(); v != vars->end_attr(); ++v) {
-			variant var;
-			var.serialize_from_string(v->second);
-			variables_[v->first] = var;
-			var_str.push_back(v->first);
+		foreach(variant key, vars.get_keys().as_list()) {
+			variables_[key.as_string()] = vars[key];
+			var_str.push_back(key.as_string());
 		}
 
-		game_logic::formula_callable_definition::entry* entry = callable_definition_.get_entry(CUSTOM_OBJECT_VARS);
-		ASSERT_LOG(entry != NULL, "CANNOT FIND VARS ENTRY IN OBJECT");
-		entry->type_definition_holder = game_logic::create_formula_callable_definition(&var_str[0], &var_str[0] + var_str.size());
-		entry->type_definition = entry->type_definition_holder.get();
+		if(!var_str. empty()) {
+			game_logic::formula_callable_definition::entry* entry = callable_definition_.get_entry(CUSTOM_OBJECT_VARS);
+			ASSERT_LOG(entry != NULL, "CANNOT FIND VARS ENTRY IN OBJECT");
+			entry->type_definition_holder = game_logic::create_formula_callable_definition(&var_str[0], &var_str[0] + var_str.size());
+			entry->type_definition = entry->type_definition_holder.get();
+		}
 	}
 
-	wml::const_node_ptr tmp_vars = node->get_child("tmp");
-	if(tmp_vars) {
+	variant tmp_vars = node["tmp_vars"];
+	if(tmp_vars.is_null() == false) {
 		std::vector<std::string> var_str;
-		for(wml::node::const_attr_iterator v = tmp_vars->begin_attr(); v != tmp_vars->end_attr(); ++v) {
-			variant var;
-			var.serialize_from_string(v->second);
-			tmp_variables_[v->first] = var;
-			var_str.push_back(v->first);
+		foreach(variant key, tmp_vars.get_keys().as_list()) {
+			variables_[key.as_string()] = tmp_vars[key];
+			var_str.push_back(key.as_string());
 		}
 
-		game_logic::formula_callable_definition::entry* entry = callable_definition_.get_entry(CUSTOM_OBJECT_TMP);
-		ASSERT_LOG(entry != NULL, "CANNOT FIND TMP ENTRY IN OBJECT");
-		entry->type_definition_holder = game_logic::create_formula_callable_definition(&var_str[0], &var_str[0] + var_str.size());
-		entry->type_definition = entry->type_definition_holder.get();
+		if(!var_str.empty()) {
+			game_logic::formula_callable_definition::entry* entry = callable_definition_.get_entry(CUSTOM_OBJECT_TMP);
+			ASSERT_LOG(entry != NULL, "CANNOT FIND TMP ENTRY IN OBJECT");
+			entry->type_definition_holder = game_logic::create_formula_callable_definition(&var_str[0], &var_str[0] + var_str.size());
+			entry->type_definition = entry->type_definition_holder.get();
+		}
 	}
 
 	//std::cerr << "TMP_VARIABLES: '" << id_ << "' -> " << tmp_variables_.size() << "\n";
 
 	consts_.reset(new game_logic::map_formula_callable);
-	wml::const_node_ptr consts = node->get_child("consts");
-	if(consts) {
-		for(wml::node::const_attr_iterator v = consts->begin_attr(); v != consts->end_attr(); ++v) {
-			variant var;
-			var.serialize_from_string(v->second);
-			consts_->add(v->first, var);
+	variant consts = node["consts"];
+	if(consts.is_null() == false) {
+		foreach(variant key, consts.get_keys().as_list()) {
+			consts_->add(key.as_string(), consts[key]);
 		}
 	}
 
-	if(node->has_attr("tags")) {
-		const std::vector<std::string> tags = util::split(node->attr("tags"));
+	if(node.has_key("tags")) {
+		const std::vector<std::string> tags = util::split(node["tags"].as_string());
 		foreach(const std::string& tag, tags) {
 			tags_[tag] = variant(1);
 		}
 	}
 
-	FOREACH_WML_CHILD(properties_node, node, "properties") {
-		for(wml::node::const_attr_iterator i = properties_node->begin_attr(); i != properties_node->end_attr(); ++i) {
-			properties_[i->first] = game_logic::formula::create_optional_formula(i->second, function_symbols(), &callable_definition_);
+	foreach(variant properties_node, node["properties"].as_list()) {
+		foreach(variant key, properties_node.get_keys().as_list()) {
+			const std::string& k = key.as_string();
+			variant value = properties_node[key];
+			if(value.is_string()) {
+				properties_[k] = game_logic::formula::create_optional_formula(value, function_symbols(), &callable_definition_);
+			} else {
+				const_properties_[k] = value;
+			}
 		}
 	}
 
-	FOREACH_WML_CHILD(variation_node, node, "object_variation") {
-		const std::string& id = variation_node->attr("id");
-		variations_[id].reset(new wml::modifier(variation_node));
+	variant variations = node["variations"];
+	if(variations.is_null() == false) {
+		foreach(const variant_pair& v, variations.as_map()) {
+			variations_[v.first.as_string()] = game_logic::formula::create_optional_formula(v.second, &get_custom_object_functions_symbol_table());
+		}
+		
 		node_ = node;
 	}
 
@@ -570,10 +748,17 @@ custom_object_type::custom_object_type(wml::const_node_ptr node, const custom_ob
 		//if we're a variation, just get the functions from our base type.
 		//variations can't define new functions.
 		object_functions_ = base_type->object_functions_;
-	} else if(node->has_attr("functions")) {
+	} else if(node.has_key("functions")) {
 		object_functions_.reset(new game_logic::function_symbol_table);
 		object_functions_->set_backup(&get_custom_object_functions_symbol_table());
-		game_logic::formula f(node->attr("functions"), object_functions_.get());
+		const variant fn = node["functions"];
+		if(fn.is_string()) {
+			game_logic::formula f(fn, object_functions_.get());
+		} else if(fn.is_list()) {
+			for(int n = 0; n != fn.num_elements(); ++n) {
+				game_logic::formula f(fn[n], object_functions_.get());
+			}
+		}
 	}
 	init_event_handlers(node, event_handlers_, function_symbols(), base_type ? &base_type->event_handlers_ : NULL);
 }
@@ -614,7 +799,7 @@ game_logic::const_formula_ptr custom_object_type::get_event_handler(int event) c
 const_particle_system_factory_ptr custom_object_type::get_particle_system_factory(const std::string& id) const
 {
 	std::map<std::string, const_particle_system_factory_ptr>::const_iterator i = particle_factories_.find(id);
-	ASSERT_LOG(i != particle_factories_.end(), "Unknown particle system type in " << id_ << ": " << id)
+	ASSERT_LOG(i != particle_factories_.end(), "Unknown particle system type in " << id_ << ": " << id);
 	return i->second;
 }
 
@@ -627,25 +812,50 @@ game_logic::function_symbol_table* custom_object_type::function_symbols() const
 	}
 }
 
+namespace {
+void execute_variation_command(variant cmd, game_logic::formula_callable& obj)
+{
+	if(cmd.is_list()) {
+		foreach(variant c, cmd.as_list()) {
+			execute_variation_command(c, obj);
+		}
+	} else if(cmd.try_convert<game_logic::command_callable>()) {
+		cmd.try_convert<game_logic::command_callable>()->execute(obj);
+	}
+}
+}
+
 const_custom_object_type_ptr custom_object_type::get_variation(const std::vector<std::string>& variations) const
 {
-	ASSERT_LOG(node_, "tried to set variation in object which has no variations");
+	ASSERT_LOG(node_.is_null() == false, "tried to set variation in object " << id_ << " which has no variations");
 
 	const_custom_object_type_ptr& result = variations_cache_[variations];
 	if(!result) {
-		wml::node_ptr node = wml::deep_copy(node_);
+		variant node = node_;
+
+		boost::intrusive_ptr<game_logic::map_formula_callable> callable(new game_logic::map_formula_callable);
+		callable->add("doc", variant(variant_callable::create(&node)));
+
 		foreach(const std::string& v, variations) {
-			std::map<std::string, wml::const_modifier_ptr>::const_iterator var_itor = variations_.find(v);
-			if(var_itor != variations_.end() && var_itor->second) {
-				var_itor->second->modify(node);
-			}
+			std::map<std::string, game_logic::const_formula_ptr>::const_iterator var_itor = variations_.find(v);
+			ASSERT_LOG(var_itor != variations_.end(), "COULD NOT FIND VARIATION " << v << " IN " << id_);
+
+			variant cmd = var_itor->second->execute(*callable);
+
+			execute_variation_command(cmd, *callable);
+
+			//std::cerr << "VARIATION " << v << ":\n--- BEFORE ---\n" << node.write_json() << "\n--- AFTER ---\n" << node_.write_json() << "\n--- DONE ---\n";
 		}
 
 		//set our constants so the variation can decide whether it needs
 		//to re-parse formulas or not.
-		const game_logic::constants_loader scope_consts(node_->get_child("consts"));
+		const game_logic::constants_loader scope_consts(node_["consts"]);
 
-		result.reset(new custom_object_type(node, this));
+		//copy the id over from the parent object, to make sure it's
+		//the same. This is important for nested objects.
+		custom_object_type* obj_type = new custom_object_type(node, this);
+		obj_type->id_ = id_;
+		result.reset(obj_type);
 	}
 
 	return result;
@@ -653,11 +863,11 @@ const_custom_object_type_ptr custom_object_type::get_variation(const std::vector
 
 void custom_object_type::load_variations() const
 {
-	if(!node_ || variations_.empty() || !node_->has_attr("load_variations")) {
+	if(node_.is_null() || variations_.empty() || !node_.has_key("load_variations")) {
 		return;
 	}
 
-	const std::vector<std::string> variations_to_load = util::split(node_->attr("load_variations"));
+	const std::vector<std::string> variations_to_load = util::split(node_["load_variations"].as_string());
 	foreach(const std::string& v, variations_to_load) {
 		get_variation(std::vector<std::string>(1, v));
 	}
@@ -670,7 +880,7 @@ BENCHMARK(custom_object_type_load)
 {
 	static std::map<std::string,std::string> file_paths;
 	if(file_paths.empty()) {
-		sys::get_unique_filenames_under_dir("data/objects", &file_paths);
+		module::get_unique_filenames_under_dir("data/objects", &file_paths);
 	}
 
 	BENCHMARK_LOOP {
@@ -703,9 +913,8 @@ UTILITY(object_definition)
 		const std::string* fname = custom_object_type::get_object_path(arg + ".cfg");
 		ASSERT_LOG(fname != NULL, "NO OBJECT FILE FOUND: " << arg);
 
-		wml::node_ptr obj_node = wml::parse_wml_from_file(*fname);
-		wml::node_ptr node = custom_object_type::merge_prototype(obj_node);
+		const variant node = custom_object_type::merge_prototype(json::parse_from_file(*fname));
 
-		std::cout << "OBJECT " << arg << "\n---\n" << wml::output(node) << "\n---\n";
+		std::cout << "OBJECT " << arg << "\n---\n" << node.write_json(true) << "\n---\n";
 	}
 }

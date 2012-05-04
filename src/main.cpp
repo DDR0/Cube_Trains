@@ -1,19 +1,5 @@
-#include <SDL.h>
-#ifndef SDL_VIDEO_OPENGL_ES
-#include <GL/glew.h>
-#endif
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
-#include <GLES/gl.h>
-#ifdef TARGET_PANDORA
-#include <GLES/glues.h>
-#endif
-#else
-#include <GL/gl.h>
-#include <GL/glu.h>
-#endif
-#if defined(__APPLE__) && !(TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE)
-#include <OpenGL/OpenGL.h>
-#endif
+#include "graphics.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -28,6 +14,7 @@
 #endif
 
 #include "asserts.hpp"
+#include "checksum.hpp"
 #include "controls.hpp"
 #include "custom_object.hpp"
 #include "custom_object_functions.hpp"
@@ -36,6 +23,7 @@
 #ifndef NO_EDITOR
 #include "editor.hpp"
 #endif
+#include "external_text_editor.hpp"
 #include "filesystem.hpp"
 #include "font.hpp"
 #include "foreach.hpp"
@@ -44,10 +32,10 @@
 #include "graphical_font.hpp"
 #include "gui_section.hpp"
 #include "i18n.hpp"
-#include "inventory.hpp"
 #include "iphone_device_info.h"
 #include "of_bridge.h"
 #include "joystick.hpp"
+#include "json_parser.hpp"
 #include "key.hpp"
 #include "level.hpp"
 #include "level_object.hpp"
@@ -55,6 +43,7 @@
 #include "load_level.hpp"
 #include "loading_screen.hpp"
 #include "message_dialog.hpp"
+#include "module.hpp"
 #include "multiplayer.hpp"
 #include "player_info.hpp"
 #include "preferences.hpp"
@@ -68,13 +57,9 @@
 #include "texture_frame_buffer.hpp"
 #include "tile_map.hpp"
 #include "unit_test.hpp"
-#include "wml_node.hpp"
-#include "wml_parser.hpp"
-#include "wml_schema.hpp"
-#include "wml_utils.hpp"
-#include "wml_writer.hpp"
+#include "variant_utils.hpp"
 
-#if defined(TARGET_PANDORA) | defined(TARGET_TEGRA)
+#if defined(TARGET_PANDORA) || defined(TARGET_TEGRA)
 #include "eglport.h"
 #elif defined(TARGET_BLACKBERRY)
 #include <EGL/egl.h>
@@ -147,6 +132,7 @@ void print_help(const std::string& argv0)
 "      --simiphone              changes various options to emulate an iPhone\n" <<
 "                                 environment\n" <<
 "      --tests                  runs the game's unit tests and exits\n" <<
+"      --edit                   Starts the game in edit mode.\n" <<
 "      --no-tests               skips the execution of unit tests on startup\n"
 "      --utility=NAME           runs the specified UTILITY( NAME ) code block,\n" <<
 "                                 such as compile_levels or object_compiler,\n" <<
@@ -156,21 +142,52 @@ void print_help(const std::string& argv0)
 
 }
 
-extern "C" int main(int argc, char** argv)
+#if defined(__ANDROID__)
+#include <jni.h>
+#include <android/asset_manager_jni.h>
+AAssetManager* static_assetManager = 0;
+extern "C" void app_set_asset_manager(AAssetManager* assetMan)
+{
+	static_assetManager = assetMan;	
+}
+namespace sys {
+AAssetManager* GetJavaAssetManager()
+{
+	return static_assetManager;
+}
+}
+#endif
+
+extern "C" int main(int argcount, char** argvec)
 {
 #if defined(TARGET_PANDORA)
     EGL_Open();
 #endif
 
+#if defined(__ANDROID__)
+	std::freopen("stdout.txt","w",stdout);
+	std::freopen("stderr.txt","w",stderr);
+	std::cerr.sync_with_stdio(true);
+#endif
+
+	LOG( "Start of main" );
+	
 	if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_JOYSTICK) < 0) {
 		std::cerr << "could not init SDL\n";
 		return -1;
 	}
+	LOG( "After SDL_Init" );
+
+#if defined(TARGET_BLACKBERRY)
+	chdir("app/native");
+	std::cout<< "Changed working directory to: " << getcwd(0, 0) << std::endl;
+#endif
 
 #ifdef TARGET_OS_HARMATTAN
 	g_type_init();
 #endif
 	i18n::init ();
+	LOG( "After i18n::init()" );
 
 //	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 1);
 
@@ -180,11 +197,7 @@ extern "C" int main(int argc, char** argv)
 	#endif
 
 	std::cerr << "Frogatto engine version " << preferences::version() << "\n";
-
-#if defined(TARGET_BLACKBERRY)
-	chdir("app/native");
-	std::cout<< "Changed working directory to: " << getcwd(0, 0) << std::endl;
-#endif
+	LOG( "After print engine version" );
 
 	std::string level_cfg = "titlescreen.cfg";
 	bool unit_tests_only = false, skip_tests = false;
@@ -201,8 +214,25 @@ extern "C" int main(int argc, char** argv)
 	std::string override_level_cfg = "";
 
 	preferences::load_preferences();
+	LOG( "After load_preferences()" );
 
-	for(int n = 1; n < argc; ++n) {
+	std::vector<std::string> argv;
+	for(int n = 1; n < argcount; ++n) {
+		argv.push_back(argvec[n]);
+	}
+
+	if(sys::file_exists("./master-config.cfg")) {
+		variant cfg = json::parse_from_file("./master-config.cfg");
+		if(cfg.is_map()) {
+			if(cfg["arguments"].is_null() == false) {
+				std::vector<std::string> additional_args = cfg["arguments"].as_list_string();
+				argv.insert(argv.begin(), additional_args.begin(), additional_args.end());
+			}
+		}
+	}
+
+	for(int n = 0; n < argv.size(); ++n) {
+		const int argc = argv.size();
 		const std::string arg(argv[n]);
 		std::string arg_name, arg_value;
 		std::string::const_iterator equal = std::find(arg.begin(), arg.end(), '=');
@@ -211,7 +241,19 @@ extern "C" int main(int argc, char** argv)
 			arg_value = std::string(equal+1, arg.end());
 		}
 		
-		if(arg_name == "--profile" || arg == "--profile") {
+		if(arg_name == "--module") {
+			variant mod_info = module::get(arg_value);
+			if(mod_info.is_null()) {
+				std::cerr << "FAILED TO LOAD MODULE: " << arg_value << "\n";
+				return -1;
+			}
+
+			module::load(arg_value);
+			if(mod_info["arguments"].is_list()) {
+				const std::vector<std::string>& arguments = mod_info["arguments"].as_list_string();
+				argv.insert(argv.end(), arguments.begin(), arguments.end());
+			}
+		} else if(arg_name == "--profile" || arg == "--profile") {
 			profile_output_buf = arg_value;
 			profile_output = profile_output_buf.c_str();
 		} else if(arg_name == "--utility") {
@@ -243,6 +285,10 @@ extern "C" int main(int argc, char** argv)
 			server = argv[++n];
 		} else if(arg == "--compiled") {
 			preferences::set_load_compiled(true);
+#ifndef NO_EDITOR
+		} else if(arg == "--edit") {
+			preferences::set_edit_on_start(true);
+#endif
 		} else if(arg == "--no-compiled") {
 			preferences::set_load_compiled(false);
 #if defined(TARGET_PANDORA)
@@ -255,7 +301,7 @@ extern "C" int main(int argc, char** argv)
 			print_help(std::string(argv[0]));
 			return 0;
 		} else {
-			const bool res = preferences::parse_arg(argv[n]);
+			const bool res = preferences::parse_arg(argv[n].c_str());
 			if(!res) {
 				std::cerr << "unrecognized arg: '" << arg << "'\n";
 				return -1;
@@ -263,7 +309,10 @@ extern "C" int main(int argc, char** argv)
 		}
 	}
 
+	checksum::manager checksum_manager;
+
 	preferences::expand_data_paths();
+	LOG( "After expand_data_paths()" );
 
 	std::cerr << "Preferences dir: " << preferences::user_data_path() << '\n';
 
@@ -274,7 +323,12 @@ extern "C" int main(int argc, char** argv)
 
 	std::cerr << "\n";
 
-#if defined(TARGET_OS_IPHONE) || defined(TARGET_BLACKBERRY)
+	if(utility_program.empty() == false && test::utility_needs_video(utility_program) == false) {
+		test::run_utility(utility_program, util_args);
+		return 0;
+	}
+
+#if defined(TARGET_OS_IPHONE) || defined(TARGET_BLACKBERRY) || defined(__ANDROID__)
 	//on the iPhone and PlayBook, try to restore the auto-save if it exists
 	if(sys::file_exists(preferences::auto_save_file_path()) && sys::read_file(std::string(preferences::auto_save_file_path()) + ".stat") == "1") {
 		level_cfg = "autosave.cfg";
@@ -359,6 +413,25 @@ extern "C" int main(int argc, char** argv)
 		return -1;
 	}
 	preferences::init_oes();
+#elif defined(__ANDROID__)
+    SDL_Rect** r = SDL_ListModes(NULL, SDL_FULLSCREEN|SDL_OPENGL);
+    if( r != (SDL_Rect**)0 && r != (SDL_Rect**)-1 ) {
+        preferences::set_actual_screen_width(r[0]->w);
+        preferences::set_actual_screen_height(r[0]->h);
+		if(r[0]->w < 640) {
+        	preferences::set_virtual_screen_width(r[0]->w*2);
+        	preferences::set_virtual_screen_height(r[0]->h*2);
+		} else {
+			preferences::set_virtual_screen_width(r[0]->w);
+			preferences::set_virtual_screen_height(r[0]->h);
+		}
+		preferences::set_control_scheme(r[0]->h >= 1024 ? "ipad_2d" : "android_med");
+    }
+
+    if (SDL_SetVideoMode(preferences::actual_screen_width(),preferences::actual_screen_height(),16,SDL_FULLSCREEN|SDL_OPENGL) == NULL) {
+		std::cerr << "could not set video mode\n";
+		return -1;
+    }
 #else
 	if (SDL_SetVideoMode(preferences::actual_screen_width(),preferences::actual_screen_height(),0,SDL_OPENGL|(preferences::resizable() ? SDL_RESIZABLE : 0)|(preferences::fullscreen() ? SDL_FULLSCREEN : 0)) == NULL) {
 		std::cerr << "could not set video mode\n";
@@ -372,6 +445,9 @@ extern "C" int main(int argc, char** argv)
 //	srand(time(NULL));
 
 	const stats::manager stats_manager;
+#ifndef NO_EDITOR
+	const external_text_editor::manager editor_manager;
+#endif // NO_EDITOR
 
 	std::cerr
 		<< "\n"
@@ -407,38 +483,41 @@ extern "C" int main(int argc, char** argv)
 
 	graphics::texture::manager texture_manager;
 
-	wml::const_node_ptr preloads;
+#ifndef NO_EDITOR
+	editor::manager editor_manager;
+#endif
+
+	variant preloads;
 	loading_screen loader;
-	
 	try {
-		wml::schema::init(wml::parse_wml_from_file("data/schema.cfg"));
+		sound::init_music(json::parse_from_file("data/music.cfg"));
 
 		std::string filename = "data/fonts." + i18n::get_locale() + ".cfg";
 		if (!sys::file_exists(filename))
 			filename = "data/fonts.cfg";
-		graphical_font::init(wml::parse_wml_from_file(filename));
+		graphical_font::init(json::parse_from_file(filename));
 
-		preloads = wml::parse_wml_from_file("data/preload.cfg");
-		int preload_items = std::distance(preloads->begin_child("preload"), preloads->end_child("preload"));
+		preloads = json::parse_from_file("data/preload.cfg");
+		int preload_items = preloads["preload"].num_elements();
 		loader.set_number_of_items(preload_items+7); // 7 is the number of items that will be loaded below
 		custom_object::init();
 		loader.draw_and_increment(_("Initializing custom object functions"));
-		init_custom_object_functions(wml::parse_wml_from_file("data/functions.cfg"));
+		init_custom_object_functions(json::parse_from_file("data/functions.cfg"));
 		loader.draw_and_increment(_("Initializing textures"));
 		loader.load(preloads);
 		loader.draw_and_increment(_("Initializing tiles"));
-		tile_map::init(wml::parse_wml_from_file("data/tiles.cfg",
-		               wml::schema::get("tiles")));
+		tile_map::init(json::parse_from_file("data/tiles.cfg"));
 		loader.draw_and_increment(_("Initializing GUI"));
 
-		wml::const_node_ptr gui_node = wml::parse_wml_from_file(preferences::load_compiled() ? "data/compiled/gui.cfg" : "data/gui.cfg");
+		variant gui_node = json::parse_from_file(preferences::load_compiled() ? "data/compiled/gui.cfg" : "data/gui.cfg");
 		gui_section::init(gui_node);
 		loader.draw_and_increment(_("Initializing GUI"));
 		framed_gui_element::init(gui_node);
-	} catch(const wml::parse_error& e) {
+
+	} catch(const json::parse_error& e) {
+		std::cerr << "ERROR PARSING: " << e.error_message() << "\n";
 		return 0;
 	}
-	
 	loader.draw(_("Loading level"));
 
 	if(!skip_tests && !test::run_tests()) {
@@ -448,7 +527,6 @@ extern "C" int main(int argc, char** argv)
 	if(unit_tests_only) {
 		return 0;
 	}
-
 #if defined(__APPLE__) && !(TARGET_IPHONE_SIMULATOR || TARGET_OS_IPHONE)
 	GLint swapInterval = 1;
 	CGLSetParameter(CGLGetCurrentContext(), kCGLCPSwapInterval, &swapInterval);
@@ -460,7 +538,6 @@ extern "C" int main(int argc, char** argv)
 #endif
 
 	loader.finish_loading();
-
 	//look to see if we got any quit events while loading.
 	{
 	SDL_Event event;
@@ -546,8 +623,9 @@ extern "C" int main(int argc, char** argv)
 		}
 	}
 
-	} //end manager scope, make managers destruct before calling SDL_Quit
+	level::clear_current_level();
 
+	} //end manager scope, make managers destruct before calling SDL_Quit
 //	controls::debug_dump_controls();
 #if defined(TARGET_PANDORA) || defined(TARGET_TEGRA)
     EGL_Destroy();
@@ -557,7 +635,7 @@ extern "C" int main(int argc, char** argv)
 	
 	preferences::save_preferences();
 	std::cerr << SDL_GetError() << "\n";
-#if !defined(TARGET_OS_HARMATTAN) && !defined(TARGET_TEGRA) && !defined(TARGET_BLACKBERRY)
+#if !defined(TARGET_OS_HARMATTAN) && !defined(TARGET_TEGRA) && !defined(TARGET_BLACKBERRY) && !defined(__ANDROID__)
 	std::cerr << gluErrorString(glGetError()) << "\n";
 #endif
 	return 0;

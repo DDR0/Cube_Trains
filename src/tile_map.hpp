@@ -11,7 +11,7 @@
 #include "geometry.hpp"
 #include "level_object.hpp"
 #include "point_map.hpp"
-#include "wml_node_fwd.hpp"
+#include "variant.hpp"
 
 struct tile_pattern;
 struct multi_tile_pattern;
@@ -22,12 +22,12 @@ struct tile_pattern_cache;
 
 class tile_map : public game_logic::formula_callable {
 public:
-	static void init(wml::const_node_ptr node);
+	static void init(variant node);
 	static void load_all();
-	static void load(const std::string& fname);
+	static void load(const std::string& fname, const std::string& tile_id);
 	tile_map();
-	explicit tile_map(wml::const_node_ptr node);
-	wml::node_ptr write() const;
+	explicit tile_map(variant node);
+	variant write() const;
 	void build_tiles(std::vector<level_tile>* tiles, const rect* r=NULL) const;
 	bool set_tile(int xpos, int ypos, const std::string& str);
 	int zorder() const { return zorder_; }
@@ -79,8 +79,8 @@ private:
 	//to this tile_map.
 	void apply_matching_multi_pattern(int& x, int y,
 	  const multi_tile_pattern& pattern,
-	  point_map<level_object_ptr>& mapping,
-	  std::map<point_zorder, level_object_ptr>& different_zorder_mapping) const;
+	  point_map<level_object*>& mapping,
+	  std::map<point_zorder, level_object*>& different_zorder_mapping) const;
 
 	//the subset of all global patterns which might be valid for this map.
 	std::vector<const tile_pattern*> patterns_;

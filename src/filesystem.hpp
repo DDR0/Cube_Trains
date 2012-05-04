@@ -13,9 +13,16 @@
 #ifndef FILESYSTEM_HPP_INCLUDED
 #define FILESYSTEM_HPP_INCLUDED
 
+#include <boost/cstdint.hpp>
+
 #include <map>
 #include <string>
 #include <vector>
+
+#if defined(__ANDROID__)
+#include "SDL.h"
+#include "SDL_rwops.h"
+#endif
 
 namespace sys
 {
@@ -49,6 +56,14 @@ void write_file(const std::string& fname, const std::string& data);
 bool file_exists(const std::string& fname);
 std::string find_file(const std::string& name);
 
+int64_t file_mod_time(const std::string& fname);
+
+#if defined(__ANDROID__)
+SDL_RWops* read_sdl_rw_from_asset(const std::string& name);
+void print_assets();
+#endif // ANDROID
+
 }
 
 #endif
+

@@ -3,10 +3,10 @@
 
 #include <string>
 
+#include "graphics.hpp"
+#include "variant.hpp"
 #if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
 #include <EGL/egl.h>
-#include <GLES/gl.h>
-#include <GLES/glext.h>
 #endif
 
 namespace game_logic {
@@ -33,6 +33,7 @@ namespace preferences {
 	void expand_data_paths();
 	void set_save_slot(const std::string& fname);
 	bool show_debug_hitboxes();
+	bool toogle_debug_hitboxes();
 	bool show_iphone_controls(); //iphone control hit rects
 	bool use_pretty_scaling();
 	void set_use_pretty_scaling(bool value);
@@ -71,6 +72,9 @@ namespace preferences {
 	bool load_compiled();
 
 	void set_load_compiled(bool value);
+	
+	void set_edit_on_start(bool value);
+	bool edit_on_start();
 
 #if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
 bool use_fbo();
@@ -105,10 +109,17 @@ void set_bequ( bool value );
 
 	bool send_stats();
 
+	bool record_history();
+	void set_record_history(bool value);
+
 	bool relay_through_server();
 	void set_relay_through_server(bool value);
 
+	variant external_code_editor();
+
 	bool run_failing_unit_tests();
+
+	bool serialize_bad_objects();
 
 	game_logic::formula_callable* registry();
 

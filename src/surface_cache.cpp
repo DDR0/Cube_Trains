@@ -13,8 +13,13 @@
 #include "asserts.hpp"
 #include "concurrent_cache.hpp"
 #include "filesystem.hpp"
+#include "module.hpp"
 #include "surface_cache.hpp"
-#include "SDL_image.h"
+#if defined(__MACOSX__) || TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
+	#include <SDL_image.h>
+#else	
+	#include <SDL/SDL_image.h>
+#endif
 
 #include <assert.h>
 #include <iostream>
@@ -50,8 +55,21 @@ surface get(const std::string& key)
 
 surface get_no_cache(const std::string& key)
 {
-	const std::string fname = path + key;
-	surface surf = surface(IMG_Load(sys::find_file(fname).c_str()));
+	std::string fname = path + key;
+#if defined(__ANDROID__)
+	if(fname[0] == '.' && fname[1] == '/') {
+		fname = fname.substr(2);
+	}
+	SDL_RWops *rw = sys::read_sdl_rw_from_asset(module::map_file(fname).c_str());
+	surface surf;
+	if(rw) {
+		surf = surface(IMG_Load_RW(rw,1));
+	} else {
+		surf = surface(IMG_Load(module::map_file(fname).c_str()));
+	}
+#else
+	surface surf = surface(IMG_Load(module::map_file(fname).c_str()));
+#endif // ANDROID
 	//std::cerr << "loading image '" << fname << "'\n";
 	if(surf.get() == false || surf->w == 0) {
 		std::cerr << "failed to load image '" << key << "'\n";

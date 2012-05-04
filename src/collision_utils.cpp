@@ -10,6 +10,15 @@ std::map<std::string, int> solid_dimensions;
 std::vector<std::string> solid_dimension_ids;
 }
 
+void collision_info::read_surf_info()
+{
+	if(surf_info) {
+		friction = surf_info->friction;
+		traction = surf_info->traction;
+		damage = surf_info->damage;
+	}
+}
+
 int get_num_solid_dimensions()
 {
 	return solid_dimensions.size();
@@ -35,8 +44,12 @@ int get_solid_dimension_id(const std::string& key)
 
 bool point_standable(const level& lvl, const entity& e, int x, int y, collision_info* info, ALLOW_PLATFORM allow_platform)
 {
-	if(allow_platform == SOLID_AND_PLATFORMS  && lvl.standable(x, y, info ? &info->friction : NULL, info ? &info->traction : NULL, info ? &info->damage : NULL) ||
-	   allow_platform != SOLID_AND_PLATFORMS  && lvl.solid(x, y, info ? &info->friction : NULL, info ? &info->traction : NULL, info ? &info->damage : NULL)) {
+	if(allow_platform == SOLID_AND_PLATFORMS  && lvl.standable(x, y, info ? &info->surf_info : NULL) ||
+	   allow_platform != SOLID_AND_PLATFORMS  && lvl.solid(x, y, info ? &info->surf_info : NULL)) {
+		if(info) {
+			info->read_surf_info();
+		}
+
 		if(info && !lvl.solid(x, y)) {
 			info->platform = true;
 		}
@@ -56,16 +69,15 @@ bool point_standable(const level& lvl, const entity& e, int x, int y, collision_
 			continue;
 		}
 
-		if(allow_platform == SOLID_AND_PLATFORMS) {
-			const rect& platform_rect = obj->platform_rect();
-			if(point_in_rect(pt, platform_rect) && obj->platform() &&
-			   obj->platform()->solid_at(pt.x - obj->x(), pt.y - obj->y())) {
+		if(allow_platform == SOLID_AND_PLATFORMS || obj->solid_platform()) {
+			const rect& platform_rect = obj->platform_rect_at(pt.x);
+			if(point_in_rect(pt, platform_rect) && obj->platform()) {
 				if(info) {
 					info->collide_with = obj;
 					info->friction = obj->surface_friction();
 					info->traction = obj->surface_traction();
 					info->adjust_y = y - platform_rect.y();
-					info->platform = true;
+					info->platform = !obj->solid_platform();
 				}
 
 				return true;
@@ -192,12 +204,12 @@ bool entity_collides_with_level(const level& lvl, const entity& e, MOVE_DIRECTIO
 		}
 	}
 
-	int* friction = info ? &info->friction : NULL;
-	int* traction = info ? &info->traction : NULL;
-	int* damage = info ? &info->damage : NULL;
-
 	foreach(const const_solid_map_ptr& m, s->solid()) {
-		if(lvl.solid(e, m->dir(dir), friction, traction, damage)) {
+		if(lvl.solid(e, m->dir(dir), info ? &info->surf_info : NULL)) {
+			if(info) {
+				info->read_surf_info();
+			}
+
 			return true;
 		}
 	}
@@ -237,11 +249,10 @@ bool non_solid_entity_collides_with_level(const level& lvl, const entity& e)
 	const int increment = e.face_right() ? 2 : -2;
 	for(int y = 0; y < f.height(); y += 2) {
 		std::vector<bool>::const_iterator i = f.get_alpha_itor(0, y, e.time_in_frame(), e.face_right());
-		if(i == f.get_alpha_buf().end()) {
-			continue;
-		}
-
 		for(int x = 0; x < f.width(); x += 2) {
+			if(i == f.get_alpha_buf().end() || i == f.get_alpha_buf().begin()) {
+				continue;
+			}
 			if(!*i && lvl.solid(e.x() + x, e.y() + y)) {
 				return true;
 			}
@@ -255,6 +266,12 @@ bool non_solid_entity_collides_with_level(const level& lvl, const entity& e)
 
 bool place_entity_in_level(level& lvl, entity& e)
 {
+	if(e.editor_force_standing()) {
+		if(!e.move_to_standing(lvl, 128)) {
+			return false;
+		}
+	}
+
 	if(!entity_collides(lvl, e, MOVE_NONE)) {
 		return true;
 	}
@@ -535,18 +552,23 @@ void detect_user_collisions(level& lvl)
 				{
 					user_collision_callable* callable = new user_collision_callable(a, b, *collision_buf[n].first, *collision_buf[n].second);
 					game_logic::formula_callable_ptr ptr(callable);
-					a->handle_event(CollideObjectID, callable);
-					a->handle_event(get_collision_event_id(*collision_buf[n].first), callable);
+					a->handle_event_delay(CollideObjectID, callable);
+					a->handle_event_delay(get_collision_event_id(*collision_buf[n].first), callable);
 				}
 
 				{
 					user_collision_callable* callable = new user_collision_callable(b, a, *collision_buf[n].second, *collision_buf[n].first);
 					game_logic::formula_callable_ptr ptr(callable);
-					b->handle_event(CollideObjectID, callable);
-					b->handle_event(get_collision_event_id(*collision_buf[n].second), callable);
+					b->handle_event_delay(CollideObjectID, callable);
+					b->handle_event_delay(get_collision_event_id(*collision_buf[n].second), callable);
 				}
 			}
 		}
+	}
+
+	for(std::vector<entity_ptr>::const_iterator i = chars.begin(); i != chars.end(); ++i) {
+		const entity_ptr& a = *i;
+		a->resolve_delayed_events();
 	}
 }
 

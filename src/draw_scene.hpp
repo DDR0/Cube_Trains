@@ -29,7 +29,13 @@ struct screen_position {
 	float zoom;
 };
 
+//Measures the current draw position in centi-pixels.
 screen_position& last_draw_position();
+
+struct disable_flashes_scope {
+	disable_flashes_scope();
+	~disable_flashes_scope();
+};
 
 void screen_color_flash(const graphics::color_transform& color, const graphics::color_transform& color_delta, int duration);
 void set_scene_title(const std::string& msg, int duration=150);

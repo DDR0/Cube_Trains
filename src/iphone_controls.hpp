@@ -1,7 +1,7 @@
 #ifndef IPHONE_CONTROLS_HPP_INCLUDED
 #define IPHONE_CONTROLS_HPP_INCLUDED
 
-#include <SDL.h>
+#include "graphics.hpp"
 
 class rect;
 
@@ -27,7 +27,7 @@ public:
 	static void draw();
 
 	static void read_controls();
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY)
+#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY) || defined(__ANDROID__)
 	static void handle_event(const SDL_Event& event);
 #endif
 

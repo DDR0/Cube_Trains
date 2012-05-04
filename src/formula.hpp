@@ -20,8 +20,8 @@
 #include "formula_callable_definition_fwd.hpp"
 #include "formula_fwd.hpp"
 #include "formula_function.hpp"
+#include "formula_tokenizer.hpp"
 #include "variant.hpp"
-#include "wml_value.hpp"
 
 namespace game_logic
 {
@@ -32,6 +32,16 @@ class formula_callable;
 class formula_expression;
 class function_symbol_table;
 typedef boost::shared_ptr<formula_expression> expression_ptr;
+
+//helper struct which contains info for a where expression.
+struct where_variables_info : public reference_counted_object {
+	explicit where_variables_info(int nslot) : base_slot(nslot) {}
+	std::vector<std::string> names;
+	std::vector<expression_ptr> entries;
+	int base_slot;
+};
+
+typedef boost::intrusive_ptr<where_variables_info> where_variables_info_ptr;
 
 class formula {
 public:
@@ -52,26 +62,43 @@ public:
 	// function which will create a formula that is a single string literal, 'str'.
 	// 'str' should not be enclosed in quotes.
 	static formula_ptr create_string_formula(const std::string& str);
-	static formula_ptr create_optional_formula(const wml::value& str, function_symbol_table* symbols=NULL, const formula_callable_definition* def=NULL);
-	explicit formula(const wml::value& val, function_symbol_table* symbols=NULL, const formula_callable_definition* def=NULL);
+	static formula_ptr create_optional_formula(const variant& str, function_symbol_table* symbols=NULL, const formula_callable_definition* def=NULL);
+	explicit formula(const variant& val, function_symbol_table* symbols=NULL, const formula_callable_definition* def=NULL);
 	~formula();
 	variant execute(const formula_callable& variables) const;
 	variant execute() const;
-	const std::string& str() const { return str_; }
+	std::string str() const { return str_.as_string(); }
+	variant str_var() const { return str_; }
 
 	void output_debug_info() const;
 
+	bool has_guards() const { return base_expr_.empty() == false; }
+	int guard_matches(const formula_callable& variables) const;
+
+	//guard matches without wrapping 'variables' in the global callable.
+	int raw_guard_matches(const formula_callable& variables) const;
+
+	const_formula_callable_ptr wrap_callable_with_global_where(const formula_callable& callable) const;
+
+	const expression_ptr& expr() const { return expr_; }
+
 private:
 	formula() {}
+	variant str_;
 	expression_ptr expr_;
-	std::string str_;
-	const std::string* filename_;
-	int line_;
-};
 
-struct formula_error
-{
-	formula_error();
+	//for recursive function formulae, we have base cases along with
+	//base expressions.
+	struct BaseCase {
+		//raw_guard is the guard without wrapping in the global where.
+		expression_ptr raw_guard, guard, expr;
+	};
+	std::vector<BaseCase> base_expr_;
+
+	where_variables_info_ptr global_where_;
+
+	void check_brackets_match(const std::vector<formula_tokenizer::token>& tokens) const;
+
 };
 
 }

@@ -6,6 +6,36 @@
 
 #define DECIMAL(num) static_cast<int64_t>(num##LL)
 
+decimal decimal::from_string(const std::string& s)
+{
+	bool negative = false;
+	const char* ptr = s.c_str();
+	if(*ptr == '-') {
+		negative = true;
+		++ptr;
+	}
+	char* endptr = NULL, *enddec = NULL;
+	int64_t n = strtol(ptr, &endptr, 10);
+	int64_t m = strtol(endptr+1, &enddec, 10);
+	int dist = enddec - endptr;
+	while(dist > (DECIMAL_PLACES+1)) {
+		m /= 10;
+		--dist;
+	}
+	while(dist < (DECIMAL_PLACES+1)) {
+		m *= 10;
+		++dist;
+	}
+
+	if(negative) {
+		n = -n;
+		m = -m;
+	}
+
+	int64_t result_value = n*DECIMAL_PRECISION + m;
+	return decimal(n*DECIMAL_PRECISION + m);
+}
+
 std::ostream& operator<<(std::ostream& s, decimal d)
 {
 	const char* minus = "";
@@ -16,8 +46,32 @@ std::ostream& operator<<(std::ostream& s, decimal d)
 
 	char buf[512];
 	sprintf(buf, "%s%lld.%06lld", minus, static_cast<long long int>(d.value()/DECIMAL_PRECISION), static_cast<long long int>((d.value() > 0 ? d.value() : -d.value())%DECIMAL_PRECISION));
+	char* ptr = buf + strlen(buf) - 1;
+	while(*ptr == '0' && ptr[-1] != '.') {
+		*ptr = 0;
+		--ptr;
+	}
 	s << buf;
 	return s;
+}
+
+decimal operator*(const decimal& a, const decimal& b)
+{
+	const int64_t va = a.value() > 0 ? a.value() : -a.value();
+	const int64_t vb = b.value() > 0 ? b.value() : -b.value();
+
+	const int64_t ia = va/DECIMAL_PRECISION;
+	const int64_t ib = vb/DECIMAL_PRECISION;
+
+	const int64_t fa = va%DECIMAL_PRECISION;
+	const int64_t fb = vb%DECIMAL_PRECISION;
+
+	const decimal result = decimal(ia*ib*DECIMAL_PRECISION + fa*ib + fb*ia + (fa*fb)/DECIMAL_PRECISION);
+	if((a.value() < 0 && b.value() > 0) || (b.value() < 0 && a.value() > 0)) {
+		return -result;
+	} else {
+		return result;
+	}
 }
 
 decimal operator/(const decimal& a, const decimal& b)
@@ -34,11 +88,6 @@ decimal operator/(const decimal& a, const decimal& b)
 
 	while(va < target_value) {
 		va *= DECIMAL(10);
-		++orders_of_magnitude_shift;
-	}
-
-	while(vb&10 == 0) {
-		vb /= DECIMAL(10);
 		++orders_of_magnitude_shift;
 	}
 
@@ -76,12 +125,23 @@ struct TestCase {
 };
 }
 
+UNIT_TEST(decimal_from_string) {
+	TestCase tests[] = {
+		{ 5.5, "5.5" },
+		{ -1.5, "-1.5" },
+	};
+
+	for(int n = 0; n != sizeof(tests)/sizeof(tests[0]); ++n) {
+		CHECK_EQ(tests[n].value, decimal::from_string(tests[n].expected).as_float());
+	}
+}
+
 UNIT_TEST(decimal_output) {
 	TestCase tests[] = {
-		{ 5.5, "5.500000" },
-		{ 4.0, "4.000000" },
-		{ -0.5, "-0.500000" },
-		{ -2.5, "-2.500000" },
+		{ 5.5, "5.5" },
+		{ 4.0, "4.0" },
+		{ -0.5, "-0.5" },
+		{ -2.5, "-2.5" },
 	};
 
 	for(int n = 0; n != sizeof(tests)/sizeof(tests[0]); ++n) {
@@ -100,6 +160,8 @@ UNIT_TEST(decimal_mul) {
 	//10934.54 * 7649.44
 	CHECK_EQ(decimal(DECIMAL(10934540000))*decimal(DECIMAL(7649440000)), decimal(DECIMAL(83643107657600)));
 	CHECK_EQ(decimal(-DECIMAL(10934540000))*decimal(DECIMAL(7649440000)), -decimal(DECIMAL(83643107657600)));
+
+	CHECK_EQ(decimal::from_string("0.08")*decimal::from_string("0.5"), decimal::from_string("0.04"));
 }
 
 UNIT_TEST(decimal_div) {

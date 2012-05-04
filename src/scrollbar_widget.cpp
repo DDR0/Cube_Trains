@@ -55,7 +55,7 @@ void scrollbar_widget::set_dim(int w, int h)
 
 	if(range_) {
 		handle_->set_loc(x(), y() + up_arrow_->height() + (window_pos_*bar_height)/range_);
-		handle_->set_dim(handle_->width(), (window_size_*bar_height)/range_);
+		handle_->set_dim(handle_->width(), std::max<int>(6, (window_size_*bar_height)/range_));
 		handle_top_->set_loc(x(), y()+ up_arrow_->height() + (window_pos_*bar_height)/range_);
 		handle_bot_->set_loc(x(), y()+ down_arrow_->height() + (window_pos_*bar_height)/range_ + (window_size_*bar_height)/range_ - handle_bot_->height() +1);
 	}
@@ -100,6 +100,29 @@ bool scrollbar_widget::handle_event(const SDL_Event& event, bool claimed)
 
 		claimed = true;
 
+#if defined(_WINDOWS)
+		if( e.button == SDL_BUTTON_WHEELUP || e.button == SDL_BUTTON_WHEELDOWN ) {
+			if(e.button == SDL_BUTTON_WHEELUP) {
+				window_pos_ -= 3 * step_;
+			} else if(e.button == SDL_BUTTON_WHEELDOWN) {
+				window_pos_ += 3 * step_;
+			}
+
+			if(window_pos_ < 0) {
+				window_pos_ = 0;
+			}
+
+			if(window_pos_ > range_ - window_size_) {
+				window_pos_ = range_ - window_size_;
+			}
+
+			if(window_pos_ != start_pos) {
+				set_dim(width(), height());
+				handler_(window_pos_);
+			}
+			return claimed;
+		}
+#endif
 		if(e.y < up_arrow_->y() + up_arrow_->height()) {
 			//on up arrow
 			window_pos_ -= step_;
@@ -118,6 +141,8 @@ bool scrollbar_widget::handle_event(const SDL_Event& event, bool claimed)
 			drag_start_ = window_pos_;
 			drag_anchor_y_ = e.y;
 		}
+
+		std::cerr << "HANDLE: " << handle_->y() << ", " << handle_->height() << "\n";
 
 		if(window_pos_ < 0) {
 			window_pos_ = 0;

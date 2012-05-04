@@ -21,7 +21,6 @@
 
 #include "reference_counted_object.hpp"
 #include "variant.hpp"
-#include "wml_node_fwd.hpp"
 
 namespace game_logic
 {
@@ -30,7 +29,7 @@ enum FORMULA_ACCESS_TYPE { FORMULA_READ_ONLY, FORMULA_WRITE_ONLY, FORMULA_READ_W
 struct formula_input {
 	std::string name;
 	FORMULA_ACCESS_TYPE access;
-	explicit formula_input(const std::string& name, FORMULA_ACCESS_TYPE access=FORMULA_READ_WRITE)
+	formula_input(const std::string& name, FORMULA_ACCESS_TYPE access=FORMULA_READ_WRITE)
 			: name(name), access(access)
 	{}
 };
@@ -38,7 +37,7 @@ struct formula_input {
 //interface for objects that can have formulae run on them
 class formula_callable : public reference_counted_object {
 public:
-	explicit formula_callable(bool has_self=true) : has_self_(has_self)
+	explicit formula_callable(bool has_self=false) : has_self_(has_self)
 	{}
 
 	variant query_value(const std::string& key) const {
@@ -92,10 +91,8 @@ protected:
 		return this < callable ? -1 : (this == callable ? 0 : 1);
 	}
 
-	virtual void serialize_to_string(std::string& str) const {
-		std::cerr << "CONTENTS {{{" << str << "}}}\n";
-		throw type_error("Tried to serialize type which cannot be serialized");
-	}
+	virtual void serialize_to_string(std::string& str) const;
+
 private:
 	virtual variant get_value(const std::string& key) const = 0;
 	virtual variant get_value_by_slot(int slot) const;
@@ -113,6 +110,10 @@ public:
 class formula_callable_with_backup : public formula_callable {
 	const formula_callable& main_;
 	const formula_callable& backup_;
+	variant get_value_by_slot(int slot) const {
+		return backup_.query_value_by_slot(slot);
+	}
+
 	variant get_value(const std::string& key) const {
 		variant var = main_.query_value(key);
 		if(var.is_null()) {
@@ -143,6 +144,10 @@ class formula_variant_callable_with_backup : public formula_callable {
 		return var;
 	}
 
+	variant get_value_by_slot(int slot) const {
+		return backup_.query_value_by_slot(slot);
+	}
+
 	void get_inputs(std::vector<formula_input>* inputs) const {
 		backup_.get_inputs(inputs);
 	}
@@ -154,10 +159,10 @@ public:
 
 class map_formula_callable : public formula_callable {
 public:
-	explicit map_formula_callable(wml::const_node_ptr node);
+	explicit map_formula_callable(variant node);
 	explicit map_formula_callable(const formula_callable* fallback=NULL);
 	explicit map_formula_callable(const std::map<std::string, variant>& m);
-	void write(wml::node_ptr node) const;
+	variant write() const;
 	map_formula_callable& add(const std::string& key, const variant& value);
 	void set_fallback(const formula_callable* fallback) { fallback_ = fallback; }
 
@@ -167,7 +172,7 @@ public:
 
 	bool empty() const { return values_.empty(); }
 	void clear() { values_.clear(); }
-	bool contains(const std::string& key) const { return values_.count(key); }
+	bool contains(const std::string& key) const { return values_.count(key) != 0; }
 
 	const std::map<std::string, variant>& values() const { return values_; }
 
@@ -181,6 +186,10 @@ public:
 private:
 	//map_formula_callable(const map_formula_callable&);
 
+	variant get_value_by_slot(int slot) const {
+		return fallback_->query_value_by_slot(slot);
+	}
+
 	variant get_value(const std::string& key) const;
 	void get_inputs(std::vector<formula_input>* inputs) const;
 	void set_value(const std::string& key, const variant& value);
@@ -193,6 +202,14 @@ typedef boost::intrusive_ptr<const formula_callable> const_formula_callable_ptr;
 
 typedef boost::intrusive_ptr<map_formula_callable> map_formula_callable_ptr;
 typedef boost::intrusive_ptr<const map_formula_callable> const_map_formula_callable_ptr;
+
+class command_callable : public formula_callable {
+public:
+	virtual void execute(formula_callable& context) const = 0;
+private:
+	variant get_value(const std::string& key) const { return variant(); }
+	void get_inputs(std::vector<game_logic::formula_input>* inputs) const {}
+};
 
 }
 

@@ -1,15 +1,18 @@
 #ifndef EDITOR_HPP_INCLUDED
 #define EDITOR_HPP_INCLUDED
+#ifndef NO_EDITOR
 
 #include <boost/function.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <stack>
 #include <vector>
 
+#include "external_text_editor.hpp"
 #include "geometry.hpp"
 #include "key.hpp"
 #include "level.hpp"
 #include "level_object.hpp"
+#include "preferences.hpp"
 #include "stats.hpp"
 
 static const int EDITOR_MENUBAR_HEIGHT = 40;
@@ -22,11 +25,12 @@ class dialog;
 namespace editor_dialogs {
 class character_editor_dialog;
 class editor_layers_dialog;
-class group_property_editor_dialog;
 class property_editor_dialog;
 class segment_editor_dialog;
 class tileset_editor_dialog;
 }
+
+class code_editor_dialog;
 
 class editor_menu_dialog;
 class editor_mode_dialog;
@@ -34,21 +38,44 @@ class editor_mode_dialog;
 class editor
 {
 public:
+	//A manager which should be scoped around creation of editors.
+	struct manager {
+		~manager();
+	};
+
+	static editor* get_editor(const char* level_cfg);
 	static void edit(const char* level_cfg, int xpos=-1, int ypos=-1);
 	static std::string last_edited_level();
 
+	static int sidebar_width();
+	static int codebar_height();
+
 	editor(const char* level_cfg);
 	~editor();
+
+	void setup_for_editing();
 	void edit_level();
+
+	void process();
+	bool handle_event(const SDL_Event& event, bool swallowed);
+	void handle_scrolling();
+
+	int xpos() const { return xpos_; }
+	int ypos() const { return ypos_; }
+
+	void set_pos(int x, int y);
+
+	typedef boost::intrusive_ptr<level> level_ptr;
+	void set_playing_level(level_ptr lvl);
+	void toggle_active_level();
 
 	void load_stats();
 	void show_stats();
 	void download_stats();
-	const std::vector<stats::record_ptr>& stats() const { return stats_; }
 
 	struct tileset {
-		static void init(wml::const_node_ptr node);
-		explicit tileset(wml::const_node_ptr node);
+		static void init(variant node);
+		explicit tileset(variant node);
 		std::string category;
 		std::string type;
 		int zorder;
@@ -59,12 +86,12 @@ public:
 	};
 
 	struct enemy_type {
-		static void init(wml::const_node_ptr node);
+		static void init(variant node);
 		explicit enemy_type(const custom_object_type& type);
-		wml::const_node_ptr node;
+		variant node;
 		std::string category;
 		entity_ptr preview_object;
-		const frame* preview_frame;
+		boost::shared_ptr<const frame> preview_frame;
 	};
 
 	struct tile_selection {
@@ -90,18 +117,18 @@ public:
 	level& get_level() { return *lvl_; }
 	const level& get_level() const { return *lvl_; }
 
+	std::vector<level_ptr> get_level_list() const { return levels_; }
+
 	void save_level();
 	void save_level_as(const std::string& filename);
 	void quit();
-	bool confirm_quit();
+	bool confirm_quit(bool allow_cancel=true);
 	void zoom_in();
 	void zoom_out();
+	int zoom() const { return zoom_; }
 
 	void undo_command();
 	void redo_command();
-
-	void edit_object_type();
-	void new_object_type();
 
 	void close() { done_ = true; }
 
@@ -143,13 +170,36 @@ public:
 	void begin_command_group();
 	void end_command_group();
 
+	void draw_gui() const;
+
+	//We are currently playing a level we are editing, and we want
+	//to reset it to its initial state.
+	void reset_playing_level(bool keep_player=true);
+
+	void toggle_pause() const;
+	void toggle_code();
+
+	bool has_keyboard_focus() const;
+
+	void start_adding_points(const std::string& field_name);
+	const std::string& adding_points() const { return adding_points_; }
+
+	int level_state_id() const { return level_changed_; }
+
+	void mutate_object_value(level_ptr lvl, entity_ptr e, const std::string& value, variant new_value);
+
 private:
+	editor(const editor&);
+	void operator=(const editor&);
+
+	//Are we editing a level that is actually being played and in motion?
+	bool editing_level_being_played() const;
+
 	void reset_dialog_positions();
 
 	void handle_mouse_button_down(const SDL_MouseButtonEvent& event);
 	void handle_mouse_button_up(const SDL_MouseButtonEvent& event);
 	void handle_key_press(const SDL_KeyboardEvent& key);
-	void handle_scrolling();
 
 	void handle_object_dragging(int mousex, int mousey);
 	void handle_drawing_rect(int mousex, int mousey);
@@ -166,22 +216,30 @@ private:
 
 	void set_selection(const tile_selection& s);
 
-	void move_object(entity_ptr e, int delta_x, int delta_y);
+	void execute_shift_object(entity_ptr e, int dx, int dy);
+
+	void move_object(level_ptr lvl, entity_ptr e, int delta_x, int delta_y);
 
 	bool editing_objects() const { return tool_ == TOOL_ADD_OBJECT || tool_ == TOOL_SELECT_OBJECT; }
 	bool editing_tiles() const { return !editing_objects(); }
 
 	//functions which add and remove an object from a level, as well as
 	//sending the object appropriate events.
-	void add_multi_object_to_level(entity_ptr e);
-	void add_object_to_level(entity_ptr e);
-	void remove_object_from_level(entity_ptr e);
+	void add_multi_object_to_level(level_ptr lvl, entity_ptr e);
+	void add_object_to_level(level_ptr lvl, entity_ptr e);
+	void remove_object_from_level(level_ptr lvl, entity_ptr e);
 
-	void mutate_object_value(entity_ptr e, const std::string& value, variant new_value);
+	void generate_mutate_commands(entity_ptr e, const std::string& attr, variant new_value,
+	                              std::vector<boost::function<void()> >& undo,
+	                              std::vector<boost::function<void()> >& redo);
+
+	void generate_remove_commands(entity_ptr e, std::vector<boost::function<void()> >& undo, std::vector<boost::function<void()> >& redo);
 
 	CKey key_;
 
-	boost::intrusive_ptr<level> lvl_;
+	level_ptr lvl_;
+
+	std::vector<level_ptr> levels_;
 	int zoom_;
 	int xpos_, ypos_;
 	int anchorx_, anchory_;
@@ -190,6 +248,11 @@ private:
 	//which the entity started the drag.
 	int selected_entity_startx_, selected_entity_starty_;
 	std::string filename_;
+
+	//If we are currently adding points to an object, this is non-empty
+	//and has the name of the field we're adding points to. The object
+	//being edited will always be lvl.editor_highlight()
+	std::string adding_points_;
 
 	EDIT_TOOL tool_;
 	bool done_;
@@ -205,11 +268,16 @@ private:
 	boost::scoped_ptr<editor_mode_dialog> editor_mode_dialog_;
 	boost::scoped_ptr<editor_dialogs::character_editor_dialog> character_dialog_;
 	boost::scoped_ptr<editor_dialogs::editor_layers_dialog> layers_dialog_;
-	boost::scoped_ptr<editor_dialogs::group_property_editor_dialog> group_property_dialog_;
 	boost::scoped_ptr<editor_dialogs::property_editor_dialog> property_dialog_;
 	boost::scoped_ptr<editor_dialogs::tileset_editor_dialog> tileset_dialog_;
 
 	boost::scoped_ptr<editor_dialogs::segment_editor_dialog> segment_dialog_;
+
+	boost::scoped_ptr<code_editor_dialog> code_dialog_;
+
+	external_text_editor_ptr external_code_editor_;
+
+	void set_code_file();
 
 	gui::dialog* current_dialog_;
 
@@ -237,10 +305,20 @@ private:
 
 	std::vector<entity_ptr> ghost_objects_;
 
-	std::vector<stats::record_ptr> stats_;
-
 	int level_changed_;
 	int selected_segment_;
+
+	int prev_mousex_, prev_mousey_;
 };
 
+struct editor_resolution_manager : private preferences::editor_screen_size_scope
+{
+	static bool is_active();
+	explicit editor_resolution_manager();
+	~editor_resolution_manager();
+	
+	int original_width_, original_height_;
+};
+
+#endif // !NO_EDITOR
 #endif

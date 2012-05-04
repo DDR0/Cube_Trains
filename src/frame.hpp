@@ -10,7 +10,6 @@
 #include "solid_map_fwd.hpp"
 #include "texture.hpp"
 #include "variant.hpp"
-#include "wml_node_fwd.hpp"
 
 namespace graphics {
 class blit_queue;
@@ -33,7 +32,7 @@ public:
 
 	static void set_color_palette(unsigned int palettes);
 
-	explicit frame(wml::const_node_ptr node);
+	explicit frame(variant node);
 	~frame();
 
 	//ID of the frame. Not unique, but is the name of the element the frame
@@ -54,6 +53,14 @@ public:
 	void draw(int x, int y, bool face_right=true, bool upside_down=false, int time=0, GLfloat rotate=0) const;
 	void draw(int x, int y, bool face_right, bool upside_down, int time, GLfloat rotate, GLfloat scale) const;
 	void draw(int x, int y, const rect& area, bool face_right=true, bool upside_down=false, int time=0, GLfloat rotate=0) const;
+
+	struct CustomPoint {
+		CustomPoint() : pos(0) {}
+		GLfloat pos;
+		point offset;
+	};
+
+	void draw_custom(int x, int y, const std::vector<CustomPoint>& points, const rect* area, bool face_right, bool upside_down, int time, GLfloat rotate) const;
 	void set_image_as_solid();
 	const_solid_info_ptr solid() const { return solid_; }
 	int collide_x() const { return collide_rect_.x()*scale_; }
@@ -106,8 +113,8 @@ public:
 	const std::vector<frame_info>& frame_layout() const { return frames_; }
 
 	point pivot(const std::string& name, int time_in_frame) const;
-private:
 	int frame_number(int time_in_frame) const;
+private:
 
 	void get_rect_in_texture(int time, GLfloat* output_rect, const frame_info*& info) const;
 	void get_rect_in_frame_number(int nframe, GLfloat* output_rect, const frame_info*& info) const;

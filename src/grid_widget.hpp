@@ -46,7 +46,8 @@ public:
 	grid& set_hpad(int pad);
 
 	void allow_selection(bool val=true) { allow_selection_ = val; }
-	void must_select(bool val=true) { must_select_ = val; selected_row_ = 0; }
+	void must_select(bool val=true, int nrow=0) { must_select_ = val; selected_row_ = nrow; }
+	bool has_must_select() const { return must_select_; }
 	void swallow_clicks(bool val=true) { swallow_clicks_ = val; }
 	int selection() const { return selected_row_; }
 	void register_mouseover_callback(callback_type cb);
@@ -56,6 +57,8 @@ public:
 	void set_max_height(int amount) { max_height_ = amount; }
 
 	void on_set_yscroll(int old_value, int value);
+
+	bool has_focus() const;
 private:
 	int row_at(int x, int y) const;
 	void recalculate_dimensions();

@@ -10,16 +10,7 @@
  
  See the COPYING file for more details.
  */
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
-#include <GLES/gl.h>
-#ifdef TARGET_PANDORA
-#include <GLES/glues.h>
-#endif
-#else
-#include <GL/gl.h>
-#include <GL/glu.h>
-#endif
-#include <SDL.h>
+ #include "graphics.hpp"
 
 #include "asserts.hpp"
 #include "foreach.hpp"
@@ -34,6 +25,20 @@
 
 namespace graphics
 {
+
+void reset_opengl_state()
+{
+	glShadeModel(GL_SMOOTH);
+	glEnable(GL_BLEND);
+	glEnable(GL_TEXTURE_2D);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+	
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+}
 
 bool set_video_mode(int w, int h)
 {
@@ -50,14 +55,8 @@ SDL_Surface* set_video_mode(int w, int h, int bitsperpixel, int flags)
 	graphics::texture::unbuild_all();
 	SDL_Surface* result = SDL_SetVideoMode(w,h,bitsperpixel,flags);
 	graphics::texture::rebuild_all();
-
-	glShadeModel(GL_SMOOTH);
-	glEnable(GL_BLEND);
-	glEnable(GL_TEXTURE_2D);
-	glEnableClientState(GL_VERTEX_ARRAY);
-	glEnableClientState(GL_TEXTURE_COORD_ARRAY);
 	
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	reset_opengl_state();
 	return result;
 }
 	

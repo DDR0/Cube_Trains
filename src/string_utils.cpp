@@ -14,85 +14,90 @@
 #include "unit_test.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <stdio.h>
+
+#include "compat.hpp"
 
 namespace util
 {
 
-bool isalnum(int c)
+bool c_isalnum(int c)
 {
 	return ::isalnum(static_cast<unsigned char>(c));
 }
 
-bool isalpha(int c)
+bool c_isalpha(int c)
 {
 	return ::isalpha(static_cast<unsigned char>(c));
 }
 
-bool isascii(int c)
+bool c_isascii(int c)
 {
-	return ::isascii(static_cast<unsigned char>(c));
+	return isascii(static_cast<unsigned char>(c));
 }
 
-bool isblank(int c)
+bool c_isblank(int c)
 {
+#if defined(_WINDOWS)
+	return __isblank(c);
+#else
 	return ::isblank(static_cast<unsigned char>(c));
+#endif
 }
 
-bool iscntrl(int c)
+bool c_iscntrl(int c)
 {
 	return ::iscntrl(static_cast<unsigned char>(c));
 }
 
-bool isdigit(int c)
+bool c_isdigit(int c)
 {
 	return ::isdigit(static_cast<unsigned char>(c));
 }
 
-bool isgraph(int c)
+bool c_isgraph(int c)
 {
 	return ::isgraph(static_cast<unsigned char>(c));
 }
 
-bool islower(int c)
+bool c_islower(int c)
 {
 	return ::islower(static_cast<unsigned char>(c));
 }
 
-bool isprint(int c)
+bool c_isprint(int c)
 {
 	return ::isprint(static_cast<unsigned char>(c));
 }
 
-bool ispunct(int c)
+bool c_ispunct(int c)
 {
 	return ::ispunct(static_cast<unsigned char>(c));
 }
 
-bool isspace(int c)
+bool c_isspace(int c)
 {
 	return ::isspace(static_cast<unsigned char>(c));
 }
 
-bool isupper(int c)
+bool c_isupper(int c)
 {
 	return ::isupper(static_cast<unsigned char>(c));
 }
 
-bool isxdigit(int c)
+bool c_isxdigit(int c)
 {
 	return ::isxdigit(static_cast<unsigned char>(c));
 }
 
-bool isnewline(char c)
+bool c_isnewline(char c)
 {
 	return c == '\r' || c == '\n';
 }
 
 bool portable_isspace(char c)
 {
-	return isnewline(c) || isspace(c);
+	return c_isnewline(c) || c_isspace(c);
 }
 
 bool notspace(char c)
@@ -111,27 +116,28 @@ std::string &strip(std::string &str)
 
 std::vector<std::string> split(std::string const &val, const std::string& delim)
 {
-	/* this might be slow but its very convenient so long as you
-	   aren't calling it too often */
-
-	std::vector< std::string > res;
-	std::string::const_iterator i1 = val.begin();
-	std::string::const_iterator i2 = val.begin();
-
-	while (i2 != val.end()) {
-		if(delim.find(*i2) != std::string::npos) {
-			std::string new_val(i1, i2);
-			res.push_back(new_val);
-			while(delim.find(*(++i2)) != std::string::npos) {}
-			i1 = i2;
+	std::vector<std::string> result;
+	if(delim.empty()) {
+		foreach(char c, val) {
+			result.push_back(std::string(1, c));
 		}
-		++i2;
+
+		return result;
 	}
-	std::string new_val(i1,i2);
-	if(!new_val.empty()) {
-		res.push_back(new_val);
+
+	const char* ptr = val.c_str();
+	for(;;) {
+		const char* end = strstr(ptr, delim.c_str());
+		if(end == NULL) {
+			result.push_back(std::string(ptr));
+			return result;
+		}
+
+		result.push_back(std::string(ptr, end));
+		ptr = end + delim.size();
 	}
-	return res;
+
+	return result;
 }
 
 std::vector<std::string> split(std::string const &val, char c, int flags)
@@ -211,6 +217,17 @@ const char* split_into_ints(const char* s, int* output, int* output_size)
 
 	*output_size = index;
 	return endptr;
+}
+
+std::vector<int> split_into_vector_int(const std::string& s)
+{
+	std::vector<std::string> v = util::split(s);
+	std::vector<int> result(v.size());
+	for(int n = 0; n != v.size(); ++n) {
+		result[n] = atoi(v[n].c_str());
+	}
+
+	return result;
 }
 
 std::string join_ints(const int* ints, int size)

@@ -1,16 +1,13 @@
 #ifndef COLOR_UTILS_HPP_INCLUDED
 #define COLOR_UTILS_HPP_INCLUDED
 
-#include "SDL.h"
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
-#include <GLES/gl.h>
-#else
-#include <GL/gl.h>
-#endif
+#include "graphics.hpp"
 
 #include <string>
 #include <vector>
 #include "formula_callable.hpp"
+
+#include "variant.hpp"
 
 SDL_Color string_to_color(const std::string& str);
 
@@ -27,9 +24,12 @@ class color : public game_logic::formula_callable
 
 	uint32_t value() const { return c_.value; }
 	
-	color( int r, int g, int b, int a);
-	explicit color( uint32_t rgba = 0);
-	explicit color( const std::string& str);
+	color( int r, int g, int b, int a=255);
+	explicit color(uint32_t rgba = 0);
+	explicit color(const std::string& str);
+	explicit color(const variant& v);
+
+	variant write() const;
 	
 	variant get_value(const std::string& key) const;
 
@@ -41,6 +41,11 @@ class color : public game_logic::formula_callable
 		pu.value = p;
 		return convert_pixel_byte_order(pu).value;
 	}
+
+	SDL_Color as_sdl_color() const;
+
+	bool operator<(const graphics::color& c) const { return value() < c.value(); }
+	bool operator==(const graphics::color& c) const { return value() == c.value(); }
 
 	private:
 		union PixelUnion {
@@ -64,7 +69,9 @@ public:
 	color_transform(const color& c);
 	color_transform(int16_t r, int16_t g, int16_t b, int16_t a);
 	explicit color_transform(const std::string& str);
+	explicit color_transform(const variant& v);
 
+	variant write() const;
 	std::string to_string() const;
 
 	int16_t r() const { return rgba_[0]; }

@@ -9,11 +9,13 @@
 #include <string>
 #include <vector>
 
-#include "boost/array.hpp"
-#include "boost/scoped_ptr.hpp"
+#include <boost/array.hpp>
+#include <boost/intrusive_ptr.hpp>
+#include <boost/scoped_ptr.hpp>
 
 #include "background.hpp"
 #include "color_utils.hpp"
+#include "decimal.hpp"
 #include "entity.hpp"
 #include "formula.hpp"
 #include "formula_callable.hpp"
@@ -26,11 +28,19 @@
 #include "raster.hpp"
 #include "speech_dialog.hpp"
 #include "tile_map.hpp"
+#include "variant.hpp"
 #include "water.hpp"
-#include "wml_node_fwd.hpp"
 #include "color_utils.hpp"
 
 class tile_corner;
+
+class level;
+class current_level_scope {
+	boost::intrusive_ptr<level> old_;
+public:
+	explicit current_level_scope(level* ptr);
+	~current_level_scope();
+};
 
 class level : public game_logic::formula_callable
 {
@@ -42,9 +52,13 @@ public:
 	static summary get_summary(const std::string& id);
 
 	static level& current();
+	static level* current_ptr();
 	void set_as_current_level();
+	static void clear_current_level();
 
-	explicit level(const std::string& level_cfg);
+	static int tile_rebuild_state_id();
+
+	explicit level(const std::string& level_cfg, variant node=variant());
 	~level();
 
 	//function to do anything which loads the level and must be done
@@ -64,19 +78,20 @@ public:
 
 	std::string package() const;
 
-	wml::node_ptr write() const;
+	variant write() const;
 	void draw(int x, int y, int w, int h) const;
 	void draw_status() const;
 	void draw_debug_solid(int x, int y, int w, int h) const;
 	void draw_background(int x, int y, int rotation) const;
 	void process();
+	void set_active_chars();
 	void process_draw();
-	bool standable(const rect& r, int* friction=NULL, int* traction=NULL, int* damage=NULL) const;
-	bool standable(int x, int y, int* friction=NULL, int* traction=NULL, int* damage=NULL) const;
-	bool standable_tile(int x, int y, int* friction=NULL, int* traction=NULL, int* damage=NULL) const;
-	bool solid(int x, int y, int* friction=NULL, int* traction=NULL, int* damage=NULL) const;
-	bool solid(const entity& e, const std::vector<point>& points, int* friction=NULL, int* traction=NULL, int* damage=NULL) const;
-	bool solid(const rect& r, int* friction=NULL, int* traction=NULL, int* damage=NULL) const;
+	bool standable(const rect& r, const surface_info** info=NULL) const;
+	bool standable(int x, int y, const surface_info** info=NULL) const;
+	bool standable_tile(int x, int y, const surface_info** info=NULL) const;
+	bool solid(int x, int y, const surface_info** info=NULL) const;
+	bool solid(const entity& e, const std::vector<point>& points, const surface_info** info=NULL) const;
+	bool solid(const rect& r, const surface_info** info=NULL) const;
 	bool may_be_solid_in_rect(const rect& r) const;
 	void set_solid_area(const rect& r, bool solid);
 	entity_ptr board(int x, int y) const;
@@ -108,6 +123,10 @@ public:
 	void add_multi_player(entity_ptr p);
 	void add_player(entity_ptr p);
 	void add_character(entity_ptr p);
+
+	//add a character that will be drawn on the scene. It will be removed
+	//from the level next time set_active_chars() is called.
+	void add_draw_character(entity_ptr p);
 
 	//schedule a character for removal at the end of the current cycle.
 	void schedule_character_removal(entity_ptr p);
@@ -145,7 +164,11 @@ public:
 	void set_character_group(entity_ptr c, int group_num);
 	int add_group();
 
-	void set_editor() { editor_ = true; prepare_tiles_for_drawing(); }
+#ifndef NO_EDITOR
+	void set_editor(bool value=true) { editor_ = value; if(editor_) { prepare_tiles_for_drawing(); } }
+#else
+	void set_editor(bool value=true) {}
+#endif // !NO_EDITOR
 	void set_editor_highlight(entity_ptr c) { editor_highlight_ = c; }
 	entity_ptr editor_highlight() const { return editor_highlight_; }
 
@@ -238,8 +261,18 @@ public:
 	//pressing up will talk to someone or enter a door etc.
 	bool can_interact(const rect& body) const;
 
+	int earliest_backup_cycle() const;
 	void replay_from_cycle(int ncycle);
 	void backup();
+	void reverse_one_cycle();
+	void reverse_to_cycle(int ncycle);
+
+	void transfer_state_to(level& lvl);
+
+	//gets historical 'shadows' of a given object back to the given cycle
+	std::vector<entity_ptr> trace_past(entity_ptr e, int ncycle);
+
+	std::vector<entity_ptr> predict_future(entity_ptr e, int ncycles);
 
 	bool is_multiplayer() const { return players_.size() > 1; }
 
@@ -252,7 +285,7 @@ public:
 
 	void editor_freeze_tile_updates(bool value);
 
-	int zoom_level() const { return zoom_level_; }
+	decimal zoom_level() const;
 
 	void add_speech_dialog(boost::shared_ptr<speech_dialog> d);
 	void remove_speech_dialog();
@@ -262,7 +295,11 @@ public:
 
 	static const game_logic::formula_callable_definition& get_formula_definition();
 	
-	bool in_editor () {return editor_;}
+#ifndef NO_EDITOR
+	bool in_editor() const {return editor_;}
+#else
+	bool in_editor() const {return false;}
+#endif // !NO_EDITOR
 
 	void add_sub_level(const std::string& lvl, int xoffset, int yoffset, bool add_objects=true);
 	void remove_sub_level(const std::string& lvl);
@@ -279,11 +316,9 @@ public:
 	bool is_arcade_level() const { return segment_height_ != 0 || segment_width_ != 0; }
 
 	variant get_var(const std::string& str) const {
-		std::map<std::string, variant>::const_iterator itor = vars_.find(str);
-		if(itor != vars_.end()) return itor->second;
-		return variant();
+		return vars_[str];
 	}
-	void set_var(const std::string& str, variant value) { vars_[str] = value; }
+	void set_var(const std::string& str, variant value) { vars_ = vars_.add_attr(variant(str), value); }
 
 	bool set_dark(bool value) { bool res = dark_; dark_ = value; return res; }
 
@@ -294,9 +329,16 @@ public:
 	int x_resolution() const { return x_resolution_; }
 	int y_resolution() const { return y_resolution_; }
 
+	bool gui_event(const SDL_Event &event);
+
+	typedef std::vector<level_tile>::const_iterator TileItor;
+	std::pair<TileItor, TileItor> tiles_at_loc(int x, int y) const;
+
+	const std::vector<std::string>& debug_properties() const { return debug_properties_; }
+
 private:
 
-	void read_compiled_tiles(wml::const_node_ptr node, std::vector<level_tile>::iterator& out);
+	void read_compiled_tiles(variant node, std::vector<level_tile>::iterator& out);
 
 	void complete_tiles_refresh();
 	void prepare_tiles_for_drawing();
@@ -312,9 +354,9 @@ private:
 
 	void rebuild_tiles_rect(const rect& r);
 	void add_tile_solid(const level_tile& t);
-	void add_solid_rect(int x1, int y1, int x2, int y2, int friction, int traction, int damage);
-	void add_solid(int x, int y, int friction, int traction, int damage);
-	void add_standable(int x, int y, int friction, int traction, int damage);
+	void add_solid_rect(int x1, int y1, int x2, int y2, int friction, int traction, int damage, const std::string& info);
+	void add_solid(int x, int y, int friction, int traction, int damage, const std::string& info);
+	void add_standable(int x, int y, int friction, int traction, int damage, const std::string& info);
 	typedef std::pair<int,int> tile_pos;
 	typedef std::bitset<TileSize*TileSize> tile_bitmap;
 
@@ -330,7 +372,7 @@ private:
 	//preferred screen dimensions to play the level on.
 	int x_resolution_, y_resolution_;
 
-	std::map<std::string, variant> vars_;
+	variant vars_;
 	
 	level_solid_map solid_;
 	level_solid_map standable_;
@@ -338,10 +380,10 @@ private:
 	level_solid_map solid_base_;
 	level_solid_map standable_base_;
 
-	bool is_solid(const level_solid_map& map, int x, int y, int* friction, int* traction, int* damage) const;
-	bool is_solid(const level_solid_map& map, const entity& e, const std::vector<point>& points, int* friction, int* traction, int* damage) const;
+	bool is_solid(const level_solid_map& map, int x, int y, const surface_info** surf_info) const;
+	bool is_solid(const level_solid_map& map, const entity& e, const std::vector<point>& points, const surface_info** surf_info) const;
 
-	void set_solid(level_solid_map& map, int x, int y, int friction, int traction, int damage, bool solid=true);
+	void set_solid(level_solid_map& map, int x, int y, int friction, int traction, int damage, const std::string& info, bool solid=true);
 
 	variant get_value_by_slot(int slot) const;
 	variant get_value(const std::string& key) const;
@@ -359,6 +401,9 @@ private:
 	};
 	std::vector<solid_rect> solid_rects_;
 	mutable std::vector<level_tile> tiles_;
+
+	//tiles sorted by position rather than zorder.
+	mutable std::vector<level_tile> tiles_by_position_;
 	std::set<int> layers_;
 	std::set<int> hidden_layers_; //layers hidden in the editor.
 	int highlight_layer_;
@@ -440,12 +485,13 @@ private:
 
 	//characters stored in wml format; they can't be loaded in a separate thread
 	//they will be loaded when complete_load_level() is called.
-	std::vector<wml::const_node_ptr> wml_chars_;
+	std::vector<variant> wml_chars_;
+	std::vector<variant> serialized_objects_;
 
-	std::vector<wml::node_ptr> wml_compiled_tiles_;
+	std::vector<variant> wml_compiled_tiles_;
 	int num_compiled_tiles_;
 
-	void load_character(wml::const_node_ptr c);
+	void load_character(variant c);
 
 	typedef std::vector<entity_ptr> entity_group;
 	std::vector<entity_group> groups_;
@@ -495,6 +541,7 @@ private:
 		int cycle;
 		std::vector<entity_ptr> chars;
 		std::vector<entity_ptr> players;
+		std::vector<entity_group> groups;
 		entity_ptr player, last_touched_player;
 	};
 
@@ -506,10 +553,10 @@ private:
 
 	int editor_tile_updates_frozen_;
 
-	std::string gui_algo_str_;
-	gui_algorithm_ptr gui_algorithm_;
+	std::vector<std::string> gui_algo_str_;
+	std::vector<gui_algorithm_ptr> gui_algorithm_;
 
-	int zoom_level_;
+	decimal zoom_level_;
 	std::vector<entity_ptr> focus_override_;
 
 	std::stack<boost::shared_ptr<speech_dialog> > speech_dialogs_;
@@ -533,8 +580,14 @@ private:
 
 	std::string sub_level_str_;
 	std::map<std::string, sub_level_data> sub_levels_;
+
+	//A list of properties that each object in the level should display
+	//for debugging purposes.
+	std::vector<std::string> debug_properties_;
 };
 
 bool entity_in_current_level(const entity* e);
+
+typedef boost::intrusive_ptr<level> level_ptr;
 
 #endif

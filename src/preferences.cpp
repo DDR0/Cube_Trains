@@ -1,7 +1,7 @@
 #include <iostream>
 #include <algorithm>
 #include <string>
-#include <SDL.h>
+#include "graphics.hpp"
 
 #include <boost/lexical_cast.hpp>
 
@@ -10,14 +10,91 @@
 #include "formatter.hpp"
 #include "formula_callable.hpp"
 #include "game_registry.hpp"
+#include "json_parser.hpp"
 #include "preferences.hpp"
 #include "sound.hpp"
-#include "wml_node.hpp"
+#include "variant_utils.hpp"
+
 #include <time.h>
 
-#include "wml_parser.hpp"
-#include "wml_utils.hpp"
-#include "wml_writer.hpp"
+#define SAVE_FILENAME					"save.cfg"
+#define AUTOSAVE_FILENAME				"autosave.cfg"
+
+#ifdef _WINDOWS
+#include <shlobj.h>
+#include <shlwapi.h>
+
+class WindowsPrefs
+{
+public:
+	std::string GetPreferencePath()   { if (State* i = Instance()) return i->GetPreferencePath(); }
+	std::string GetSaveFilePath()     { if (State* i = Instance()) return i->GetSaveFilePath(); }
+	std::string GetAutoSaveFilePath() { if (State* i = Instance()) return i->GetAutoSaveFilePath(); }
+	
+private:
+	struct State 
+	{
+	private:
+		std::string preferences_path;
+		std::string save_file_path;
+		std::string auto_save_file_path;
+	public:
+		State::State()
+		{
+			TCHAR szPath[ MAX_PATH ];
+			if( SUCCEEDED( SHGetFolderPath( NULL, CSIDL_APPDATA, NULL, 0, szPath ) ) ) 
+			{
+				::PathAppend( szPath, TEXT( "\\Frogatto\\" ) );
+			}
+			this->preferences_path = std::string( szPath );
+			this->save_file_path = this->preferences_path + TEXT( SAVE_FILENAME );
+			this->auto_save_file_path = this->preferences_path + TEXT( AUTOSAVE_FILENAME );
+		}
+		std::string GetPreferencePath()
+		{
+			return this->preferences_path;
+		};
+
+		std::string GetSaveFilePath()
+		{
+			return this->save_file_path;
+		}
+
+		std::string GetAutoSaveFilePath()
+		{
+			return this->auto_save_file_path;
+		}
+	};
+
+	static State* Instance();
+	static void CleanUp();
+
+	static bool MDestroyed;
+	static State* MInstance;
+};
+
+bool WindowsPrefs::MDestroyed = false;
+WindowsPrefs::State* WindowsPrefs::MInstance = 0;
+
+WindowsPrefs::State* WindowsPrefs::Instance()
+{
+	if( !MDestroyed && !MInstance ) {
+		MInstance = new State();
+		atexit( &CleanUp );
+	}
+	return MInstance;
+}
+
+void WindowsPrefs::CleanUp()
+{
+	delete MInstance;
+	MInstance = 0;
+	MDestroyed = true;
+}
+
+WindowsPrefs winPrefs;
+#endif // _WINDOWS
+
 
 namespace preferences {
 	const std::string& version() {
@@ -47,6 +124,12 @@ namespace preferences {
 		bool relay_through_server_ = false;
 		
 		std::string control_scheme_ = "iphone_2d";
+
+		bool record_history_ = false;
+
+		bool edit_on_start_ = false;
+
+		variant external_code_editor_;
 		
 #if TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
 		
@@ -83,6 +166,30 @@ namespace preferences {
 		int virtual_screen_height_ = 480;
 
 		int actual_screen_width_ = 854;
+		int actual_screen_height_ = 480;
+
+		bool screen_rotated_ = false;
+
+		bool use_joystick_ = true;
+
+		bool load_compiled_ = true;
+
+		bool use_fbo_ = true;
+		bool use_bequ_ = true;
+
+		bool use_16bpp_textures_ = true;
+#elif defined(__ANDROID__)
+
+#ifndef PREFERENCES_PATH
+#define PREFERENCES_PATH ".frogatto/"
+#endif
+
+		bool send_stats_ = false;
+		bool sim_iphone_ = false;
+		int virtual_screen_width_ = 800;
+		int virtual_screen_height_ = 480;
+
+		int actual_screen_width_ = 800;
 		int actual_screen_height_ = 480;
 
 		bool screen_rotated_ = false;
@@ -157,9 +264,6 @@ namespace preferences {
 		bool use_16bpp_textures_ = false;
 #endif
 
-#define SAVE_FILENAME					"save.cfg"
-#define AUTOSAVE_FILENAME				"autosave.cfg"
-
 		std::string preferences_path_ = PREFERENCES_PATH;
 		std::string save_file_path_ = PREFERENCES_PATH SAVE_FILENAME;
 		std::string auto_save_file_path_ = PREFERENCES_PATH AUTOSAVE_FILENAME;
@@ -167,6 +271,7 @@ namespace preferences {
 		bool force_no_npot_textures_ = false;
 
 		bool run_failing_unit_tests_ = false;
+		bool serialize_bad_objects_ = false;
 	}
 
 	int get_unique_user_id() {
@@ -259,6 +364,12 @@ namespace preferences {
 	
 	bool show_debug_hitboxes() {
 		return show_debug_hitboxes_;
+	}
+
+	bool toogle_debug_hitboxes() {
+		bool shown = show_debug_hitboxes_;
+		show_debug_hitboxes_ = !show_debug_hitboxes_;
+		return shown;
 	}
 	
 	bool show_iphone_controls() {
@@ -367,6 +478,16 @@ namespace preferences {
 	{
 		load_compiled_ = value;
 	}
+
+	bool edit_on_start()
+	{
+		return edit_on_start_;
+	}
+	
+	void set_edit_on_start(bool value)
+	{
+		edit_on_start_ = value;
+	}
 	
 #if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
 	bool use_fbo()
@@ -427,66 +548,88 @@ namespace preferences {
 
 	void load_preferences()
 	{
+#if defined( _WINDOWS )
+		preferences_path_ = winPrefs.GetPreferencePath();
+		save_file_path_ = winPrefs.GetSaveFilePath();
+		auto_save_file_path_ = winPrefs.GetAutoSaveFilePath();
+		std::string path = preferences_path_;
+#else
 		std::string path = PREFERENCES_PATH;
+#endif // defined( _WINDOWS )
 		expand_path(path);
 		if(!sys::file_exists(path + "preferences.cfg")) {
 			return;
 		}
 
-		const wml::const_node_ptr node = wml::parse_wml_from_file(path + "preferences.cfg");
-		if(node.get() == NULL) {
+		variant node;
+		
+		try {
+			node = json::parse_from_file(path + "preferences.cfg");
+		} catch(json::parse_error&) {
 			return;
 		}
 
-		unique_user_id = wml::get_int(node, "user_id", 0);
+		unique_user_id = node["user_id"].as_int(0);
 
-		use_joystick_ = wml::get_bool(node, "joystick", use_joystick_);
+		use_joystick_ = node["joystick"].as_bool(use_joystick_);
+		variant show_control_rects = node["show_iphone_controls"];
+		if(show_control_rects.is_null() == false) {
+			show_iphone_controls_ = show_control_rects.as_bool(show_iphone_controls_);
+		}
 
-		no_sound_ = wml::get_bool(node, "no_sound", no_sound_);
-		no_music_ = wml::get_bool(node, "no_music", no_music_);
-		reverse_ab_ = wml::get_bool(node, "reverse_ab", reverse_ab_);
+		no_sound_ = node["no_sound"].as_bool(no_sound_);
+		no_music_ = node["no_music"].as_bool(no_music_);
+		reverse_ab_ = node["reverse_ab"].as_bool(reverse_ab_);
 
-		sound::set_music_volume(wml::get_int(node, "music_volume", 1000)/1000.0);
-		sound::set_sound_volume(wml::get_int(node, "sound_volume", 1000)/1000.0);
+		sound::set_music_volume(node["music_volume"].as_int(1000)/1000.0);
+		sound::set_sound_volume(node["sound_volume"].as_int(1000)/1000.0);
 
-		const wml::const_node_ptr registry_node = node->get_child("registry");
-		if(registry_node) {
+		const variant registry_node = node["registry"];
+		if(registry_node.is_null() == false) {
 			game_registry::instance().set_contents(registry_node);
 		}
 
+		if(node["code_editor"].is_map()) {
+			external_code_editor_ = node["code_editor"];
+		}
+
 #if !TARGET_OS_IPHONE && !TARGET_IPHONE_SIMULATOR
-		controls::set_sdlkey(controls::CONTROL_UP, static_cast<SDLKey>(wml::get_int(node, "key_up", SDLK_UP)));
-		controls::set_sdlkey(controls::CONTROL_DOWN, static_cast<SDLKey>(wml::get_int(node, "key_down", SDLK_DOWN)));
-		controls::set_sdlkey(controls::CONTROL_LEFT, static_cast<SDLKey>(wml::get_int(node, "key_left", SDLK_LEFT)));
-		controls::set_sdlkey(controls::CONTROL_RIGHT, static_cast<SDLKey>(wml::get_int(node, "key_right", SDLK_RIGHT)));
-		controls::set_sdlkey(controls::CONTROL_ATTACK, static_cast<SDLKey>(wml::get_int(node, "key_attack", SDLK_d)));
-		controls::set_sdlkey(controls::CONTROL_JUMP, static_cast<SDLKey>(wml::get_int(node, "key_jump", SDLK_a)));
-		controls::set_sdlkey(controls::CONTROL_TONGUE, static_cast<SDLKey>(wml::get_int(node, "key_tongue", SDLK_s)));
+		controls::set_sdlkey(controls::CONTROL_UP, static_cast<SDLKey>(node["key_up"].as_int(SDLK_UP)));
+		controls::set_sdlkey(controls::CONTROL_DOWN, static_cast<SDLKey>(node["key_down"].as_int(SDLK_DOWN)));
+		controls::set_sdlkey(controls::CONTROL_LEFT, static_cast<SDLKey>(node["key_left"].as_int(SDLK_LEFT)));
+		controls::set_sdlkey(controls::CONTROL_RIGHT, static_cast<SDLKey>(node["key_right"].as_int(SDLK_RIGHT)));
+		controls::set_sdlkey(controls::CONTROL_ATTACK, static_cast<SDLKey>(node["key_attack"].as_int(SDLK_d)));
+		controls::set_sdlkey(controls::CONTROL_JUMP, static_cast<SDLKey>(node["key_jump"].as_int(SDLK_a)));
+		controls::set_sdlkey(controls::CONTROL_TONGUE, static_cast<SDLKey>(node["key_tongue"].as_int(SDLK_s)));
 #endif
 	}
 
 	void save_preferences()
 	{
-		wml::node_ptr node(new wml::node("preferences"));
-		node->set_attr("user_id", formatter() << get_unique_user_id());
-		node->set_attr("no_sound", no_sound_ ? "true" : "false");
-		node->set_attr("no_music", no_music_ ? "true" : "false");
-		node->set_attr("reverse_ab", reverse_ab_ ? "true" : "false");
-		node->set_attr("joystick", use_joystick_ ? "true" : "false");
-		node->set_attr("sound_volume", formatter() << static_cast<int>(sound::get_sound_volume()*1000));
-		node->set_attr("music_volume", formatter() << static_cast<int>(sound::get_music_volume()*1000));
-		node->set_attr("key_up", formatter() << controls::get_sdlkey(controls::CONTROL_UP));
-		node->set_attr("key_down", formatter() << controls::get_sdlkey(controls::CONTROL_DOWN));
-		node->set_attr("key_left", formatter() << controls::get_sdlkey(controls::CONTROL_LEFT));
-		node->set_attr("key_right", formatter() << controls::get_sdlkey(controls::CONTROL_RIGHT));
-		node->set_attr("key_attack", formatter() << controls::get_sdlkey(controls::CONTROL_ATTACK));
-		node->set_attr("key_jump", formatter() << controls::get_sdlkey(controls::CONTROL_JUMP));
-		node->set_attr("key_tongue", formatter() << controls::get_sdlkey(controls::CONTROL_TONGUE));
+		variant_builder node;
+		node.add("user_id", get_unique_user_id());
+		node.add("no_sound", variant::from_bool(no_sound_));
+		node.add("no_music", variant::from_bool(no_music_));
+		node.add("reverse_ab", variant::from_bool(reverse_ab_));
+		node.add("joystick", variant::from_bool(use_joystick_));
+		node.add("sound_volume", static_cast<int>(sound::get_sound_volume()*1000));
+		node.add("music_volume", static_cast<int>(sound::get_music_volume()*1000));
+		node.add("key_up", controls::get_sdlkey(controls::CONTROL_UP));
+		node.add("key_down", controls::get_sdlkey(controls::CONTROL_DOWN));
+		node.add("key_left", controls::get_sdlkey(controls::CONTROL_LEFT));
+		node.add("key_right", controls::get_sdlkey(controls::CONTROL_RIGHT));
+		node.add("key_attack", controls::get_sdlkey(controls::CONTROL_ATTACK));
+		node.add("key_jump", controls::get_sdlkey(controls::CONTROL_JUMP));
+		node.add("key_tongue", controls::get_sdlkey(controls::CONTROL_TONGUE));
+		node.add("show_iphone_controls", variant::from_bool(show_iphone_controls_));
 
-		wml::node_ptr registry_node(new wml::node("registry"));
-		game_registry::instance().write_contents(registry_node);
-		node->add_child(registry_node);
-		sys::write_file(preferences_path_ + "preferences.cfg", wml::output(node));
+		if(external_code_editor_.is_null() == false) {
+			node.add("code_editor", external_code_editor_);
+		}
+
+		node.add("registry", game_registry::instance().write_contents());
+
+		sys::write_file(preferences_path_ + "preferences.cfg", node.build().write_json());
 	}
 
 	editor_screen_size_scope::editor_screen_size_scope() : width_(virtual_screen_width_), height_(virtual_screen_height_) {
@@ -597,6 +740,8 @@ namespace preferences {
 			send_stats_ = true;
 		} else if(s == "--no-send-stats") {
 			send_stats_ = false;
+		} else if(s == "--time-travel") {
+			record_history_ = true;
 		} else if(s == "--joystick") {
 			use_joystick_ = true;
 		} else if(s == "--no-joystick") {
@@ -605,6 +750,8 @@ namespace preferences {
 			relay_through_server_ = true;
 		} else if(s == "--failing-tests") {
 			run_failing_unit_tests_ = true;
+		} else if(s == "--serialize-bad-objects") {
+			serialize_bad_objects_ = true;
 		} else {
 			return false;
 		}
@@ -624,8 +771,20 @@ namespace preferences {
 		return send_stats_;
 	}
 
+	bool record_history() {
+		return record_history_;
+	}
+
+	void set_record_history(bool value) {
+		record_history_ = value;
+	}
+
 	bool relay_through_server() {
 		return relay_through_server_;
+	}
+
+	variant external_code_editor() {
+		return external_code_editor_;
 	}
 
 	void set_relay_through_server(bool value) {
@@ -634,6 +793,10 @@ namespace preferences {
 
 	bool run_failing_unit_tests() {
 		return run_failing_unit_tests_;
+	}
+
+	bool serialize_bad_objects() {
+		return serialize_bad_objects_;
 	}
 
 #if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)

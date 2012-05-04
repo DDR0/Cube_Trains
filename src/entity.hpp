@@ -14,10 +14,9 @@
 #include "geometry.hpp"
 #include "key.hpp"
 #include "light.hpp"
-#include "powerup_fwd.hpp"
 #include "solid_map_fwd.hpp"
 #include "wml_formula_callable.hpp"
-#include "wml_node_fwd.hpp"
+#include "variant.hpp"
 
 class character;
 class frame;
@@ -30,13 +29,13 @@ typedef boost::intrusive_ptr<character> character_ptr;
 class entity : public game_logic::wml_serializable_formula_callable
 {
 public:
-	static entity_ptr build(wml::const_node_ptr node);
-	explicit entity(wml::const_node_ptr node);
+	static entity_ptr build(variant node);
+	explicit entity(variant node);
 	entity(int x, int y, bool face_right);
 	virtual ~entity() {}
 
 	virtual void finish_loading() {}
-	virtual wml::node_ptr write() const = 0;
+	virtual variant write() const = 0;
 	virtual void setup_drawing() const {}
 	virtual void draw() const = 0;
 	virtual void draw_group() const = 0;
@@ -91,11 +90,13 @@ public:
 
 	virtual bool point_collides(int x, int y) const = 0;
 	virtual bool rect_collides(const rect& r) const = 0;
-	const solid_info* platform() const { return platform_; }
-	const solid_info* solid() const { return solid_; }
+	const solid_info* platform() const { return platform_.get(); }
+	const solid_info* solid() const { return solid_.get(); }
 	const rect& solid_rect() const { return solid_rect_; }
 	const rect& frame_rect() const { return frame_rect_; }
 	rect platform_rect() const { return platform_rect_; }
+	virtual rect platform_rect_at(int xpos) const { return platform_rect(); }
+	virtual bool solid_platform() const { return false; }
 	rect body_rect() const;
 	rect hit_rect() const;
 	point midpoint() const;
@@ -116,6 +117,7 @@ public:
 
 	void set_platform_motion_x(int value);
 	int platform_motion_x() const;
+	int map_platform_pos(int xpos) const;
 
 	bool face_right() const { return face_right_; }
 	virtual void set_face_right(bool facing);
@@ -133,6 +135,8 @@ public:
 	virtual int teleport_offset_y() const { return 0; }
 	virtual bool no_move_to_standing() const { return 0; }
 	virtual bool reverse_global_vertical_zordering() const { return 0; }
+
+	virtual entity_ptr standing_on() const = 0;
 
 	virtual void die_with_no_event() = 0;
 	virtual bool is_active(const rect& screen_area) const = 0;
@@ -167,7 +171,9 @@ public:
 
 	void draw_debug_rects() const;
 
+#ifndef NO_EDITOR
 	virtual const_editor_entity_info_ptr editor_info() const { return const_editor_entity_info_ptr(); }
+#endif // !NO_EDITOR
 
 	virtual entity_ptr clone() const { return entity_ptr(); }
 	virtual entity_ptr backup() const = 0;
@@ -179,6 +185,8 @@ public:
 
 	virtual void handle_event(const std::string& id, const formula_callable* context=NULL) {}
 	virtual void handle_event(int id, const formula_callable* context=NULL) {}
+	virtual void handle_event_delay(int id, const formula_callable* context=NULL) {}
+	virtual void resolve_delayed_events() = 0;
 
 	//function which returns true if this object can be 'interacted' with.
 	//i.e. if the player ovelaps with the object and presses up if they will
@@ -202,22 +210,9 @@ public:
 	virtual entity_ptr driver() { return entity_ptr(); }
 	virtual const_entity_ptr driver() const { return const_entity_ptr(); }
 
-	virtual void move_to_standing(level& lvl) {}
+	virtual bool move_to_standing(level& lvl, int max_displace=10000) { return false; }
 	virtual int hitpoints() const { return 1; }
 	virtual int max_hitpoints() const { return 1; }
-	virtual int num_powerups() const { return 0; }
-
-	virtual void get_powerup(const std::string& id) {}
-	virtual void get_powerup(const_powerup_ptr powerup) {}
-	virtual void remove_powerup() {}
-	virtual int remove_powerup(const_powerup_ptr powerup) { return 0; }
-	virtual const std::vector<const_powerup_ptr>& powerups() const;
-	virtual const std::vector<const_powerup_ptr>& abilities() const;
-
-	//function to perform preloading of a powerup so it'll be ready to apply
-	//to this type of object when needed
-	virtual void preload_powerup(const_powerup_ptr powerup) {}
-	virtual bool is_powerup_loaded(const_powerup_ptr powerup) const { return true; }
 
 	void set_control_status(const std::string& key, bool value);
 	void set_control_status(controls::CONTROL_ITEM ctrl, bool value) { controls_[ctrl] = value; }
@@ -254,10 +249,17 @@ public:
 
 	virtual int parent_depth(int cur_depth=0) const { return 0; }
 
+	virtual bool editor_force_standing() const = 0;
+
+	void set_spawned_by(const std::string& key);
+	const std::string& spawned_by() const;
+
+	virtual const bool mouse_event_swallowed() {return false;}
+
 protected:
 
-	virtual const solid_info* calculate_solid() const = 0;
-	virtual const solid_info* calculate_platform() const = 0;
+	virtual const_solid_info_ptr calculate_solid() const = 0;
+	virtual const_solid_info_ptr calculate_platform() const = 0;
 	void calculate_solid_rect();
 
 	bool control_status(controls::CONTROL_ITEM ctrl) const { return controls_[ctrl]; }
@@ -280,7 +282,7 @@ protected:
 private:
 	virtual void control(const level& lvl) = 0;
 
-	wml::node_ptr serialize_to_wml() const { return write(); }
+	variant serialize_to_wml() const { return write(); }
 
 	std::string label_;
 
@@ -314,11 +316,13 @@ private:
 	std::vector<entity_ptr> attached_objects_;
 
 	//caches of commonly queried rects.
-	rect solid_rect_, frame_rect_, platform_rect_;
-	const solid_info* solid_;
-	const solid_info* platform_;
+	rect solid_rect_, frame_rect_, platform_rect_, prev_platform_rect_;
+	const_solid_info_ptr solid_;
+	const_solid_info_ptr platform_;
 
 	int platform_motion_x_;
+
+	std::string spawned_by_;
 };
 
 #endif

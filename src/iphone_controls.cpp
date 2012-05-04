@@ -1,21 +1,21 @@
 #include "iphone_controls.hpp"
 
-#if TARGET_OS_HARMATTAN || TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR || TARGET_BLACKBERRY
+#if TARGET_OS_HARMATTAN || TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR || TARGET_BLACKBERRY || defined(__ANDROID__)
 
-#include <SDL.h>
+#include "graphics.hpp"
 
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY)
+#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY) || defined(__ANDROID__)
 #include <math.h> // sqrt
 #endif
 
 #include "foreach.hpp"
+#include "formula.hpp"
 #include "geometry.hpp"
+#include "json_parser.hpp"
 #include "preferences.hpp"
 #include "raster.hpp"
 #include "texture.hpp"
-#include "wml_parser.hpp"
-#include "wml_utils.hpp"
-#include "formula.hpp"
+#include "variant.hpp"
 
 namespace
 {
@@ -27,7 +27,7 @@ namespace
 	bool can_interact = false;
 	bool on_platform = false;
 	bool is_standing = false;
-	
+
 	std::string loaded_control_scheme = "";
 	static void setup_rects ()
 	{
@@ -40,18 +40,24 @@ namespace
 		
 		underwater_circle_y = preferences::virtual_screen_height()-underwater_circle_y;
 		
-		wml::node_ptr schemes = wml::parse_wml_from_file("data/control_schemes.cfg");
-		wml::node_ptr scheme = wml::find_child_by_attribute(schemes, "control_scheme", "id", scheme_name);
+		variant schemes = json::parse_from_file("data/control_schemes.cfg");
+		variant scheme;
+		foreach(const variant& candidate, schemes["control_scheme"].as_list()) {
+			if(candidate["id"].as_string() == scheme_name) {
+				scheme = candidate;
+				break;
+			}
+		}
 		
-		underwater_circle_x = game_logic::formula(wml::get_str(scheme, "underwater_circle_x")).execute().as_int();
-		underwater_circle_y = game_logic::formula(wml::get_str(scheme, "underwater_circle_y")).execute().as_int();
-		underwater_circle_rad = game_logic::formula(wml::get_str(scheme, "underwater_circle_rad")).execute().as_int();
+		underwater_circle_x = game_logic::formula(scheme["underwater_circle_x"]).execute().as_int();
+		underwater_circle_y = game_logic::formula(scheme["underwater_circle_y"]).execute().as_int();
+		underwater_circle_rad = game_logic::formula(scheme["underwater_circle_rad"]).execute().as_int();
 		
-		FOREACH_WML_CHILD(node, scheme, "button")
+		foreach(variant node, scheme["button"].as_list())
 		{
-			variant r = game_logic::formula(wml::get_str(node, "hit_rect")).execute();
+			variant r = game_logic::formula(node["hit_rect"]).execute();
 			rect hit_rect(r[0].as_int(), r[1].as_int(), r[2].as_int(), r[3].as_int());
-			std::string id = wml::get_str(node, "id");
+			std::string id = node["id"].as_string();
 			if (id == "left") {
 				left_arrow = hit_rect;
 			} else if (id == "right") {
@@ -80,6 +86,9 @@ namespace
 		bool active;
 		int x, y;
 		int starting_x, starting_y;
+#if defined(__ANDROID__)
+        int pressure; 
+#endif
 	};
 
 	std::vector<Mouse> all_mice, active_mice;
@@ -103,7 +112,7 @@ void iphone_controls::read_controls()
 {
 	active_mice.clear();
 
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY)
+#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY) || defined(__ANDROID__)
 	// there is no SDL_Get_NumMice and SDL_SelectMouse support on
 	// Harmattan, so all_mice has been updated via calls to handle_event
 	const int nmice = all_mice.size();
@@ -140,9 +149,33 @@ void iphone_controls::read_controls()
 	}
 }
 
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY)
+#if defined(__ANDROID__)
 void iphone_controls::handle_event (const SDL_Event& event)
 {
+	int x = event.type == SDL_JOYBALLMOTION ? event.jball.xrel : event.jbutton.x;
+	int y = event.type == SDL_JOYBALLMOTION ? event.jball.yrel : event.jbutton.y;
+	int i = event.type == SDL_JOYBALLMOTION ? event.jball.ball : event.jbutton.button;
+	std::string joy_txt = event.type == SDL_JOYBUTTONUP ? "up" : event.type == SDL_JOYBUTTONDOWN ? "down" : "move";
+	LOG( "mouse " << joy_txt << " (" << x << "," << y << ";" << i << ")");
+	translate_mouse_coords(&x, &y);
+	while(all_mice.size() <= i) {
+		all_mice.push_back(Mouse());
+		all_mice[i].active = false;
+	}
+
+	if(!all_mice[i].active) {
+		all_mice[i].starting_x = x;
+		all_mice[i].starting_y = y;
+	}
+
+	all_mice[i].x = x;
+	all_mice[i].y = y;
+	all_mice[i].active = event.type != SDL_JOYBUTTONUP;
+}
+     
+#elif defined(TARGET_OS_HARMATTAN) || defined(TARGET_BLACKBERRY)
+
+void iphone_controls::handle_event (const SDL_Event& event)
 	int x = event.type == SDL_MOUSEMOTION ? event.motion.x : event.button.x;
 	int y = event.type == SDL_MOUSEMOTION ? event.motion.y : event.button.y;
 	int i = event.type == SDL_MOUSEMOTION ? event.motion.which : event.button.which;
@@ -161,6 +194,7 @@ void iphone_controls::handle_event (const SDL_Event& event)
 	all_mice[i].y = y;
 	all_mice[i].active = event.type != SDL_MOUSEBUTTONUP;
 }
+
 #endif
 
 void iphone_controls::set_underwater(bool value)

@@ -45,7 +45,11 @@ int call_boost_function(void* arg)
 
 }
 
+#if defined(__ANDROID__) && SDL_VERSION_ATLEAST(1, 3, 0)
+thread::thread(const std::string& name, boost::function<void()> fn) : fn_(fn), thread_(SDL_CreateThread(call_boost_function, name.c_str(), new boost::function<void()>(fn_)))
+#else
 thread::thread(boost::function<void()> fn) : fn_(fn), thread_(SDL_CreateThread(call_boost_function, new boost::function<void()>(fn_)))
+#endif
 {}
 
 thread::~thread()
@@ -83,7 +87,15 @@ mutex::~mutex()
 	SDL_DestroyMutex(m_);
 }
 
-lock::lock(mutex& m) : m_(m)
+mutex::mutex(const mutex&) : m_(SDL_CreateMutex())
+{}
+
+const mutex& mutex::operator=(const mutex&)
+{
+	return *this;
+}
+
+lock::lock(const mutex& m) : m_(m)
 {
 	SDL_mutexP(m_.m_);
 }

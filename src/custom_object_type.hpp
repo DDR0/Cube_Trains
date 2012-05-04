@@ -4,7 +4,6 @@
 #include <map>
 #include <string>
 
-#include "boost/scoped_ptr.hpp"
 #include "boost/shared_ptr.hpp"
 
 #include "custom_object_callable.hpp"
@@ -16,7 +15,6 @@
 #include "particle_system.hpp"
 #include "solid_map_fwd.hpp"
 #include "variant.hpp"
-#include "wml_node.hpp"
 
 class custom_object_type;
 
@@ -31,7 +29,7 @@ typedef boost::shared_ptr<const modifier> const_modifier_ptr;
 class custom_object_type
 {
 public:
-	static wml::node_ptr merge_prototype(wml::node_ptr node);
+	static variant merge_prototype(variant node);
 	static const std::string* get_object_path(const std::string& id);
 	static const_custom_object_type_ptr get(const std::string& id);
 	static const_custom_object_type_ptr get_or_die(const std::string& id);
@@ -40,14 +38,21 @@ public:
 	static void invalidate_all_objects();
 	static std::vector<const_custom_object_type_ptr> get_all();
 
+	static bool set_file_contents(const std::string& path, const std::string& contents);
+
+	static int reload_modified_code();
+	static bool reload_object(const std::string& type);
+
+	static int num_object_reloads();
+
 	typedef std::vector<game_logic::const_formula_ptr> event_handler_map;
 
-	static void init_event_handlers(wml::const_node_ptr node,
+	static void init_event_handlers(variant node,
 	                                event_handler_map& handlers,
 									game_logic::function_symbol_table* symbols=0,
 									const event_handler_map* base_handlers=NULL);
 
-	explicit custom_object_type(wml::const_node_ptr node, const custom_object_type* base_type=NULL);
+	explicit custom_object_type(variant node, const custom_object_type* base_type=NULL, const custom_object_type* old_type=NULL);
 	~custom_object_type();
 
 	const_custom_object_type_ptr get_sub_object(const std::string& id) const;
@@ -106,12 +111,12 @@ public:
 
 	bool affected_by_currents() const { return affected_by_currents_; }
 
-	wml::const_node_ptr get_child(const std::string& key) const {
+	variant get_child(const std::string& key) const {
 		if(children_.count(key)) {
 			return children_.find(key)->second;
 		}
 
-		return wml::const_node_ptr();
+		return variant();
 	}
 
 	const_particle_system_factory_ptr get_particle_system_factory(const std::string& id) const;
@@ -131,6 +136,7 @@ public:
 	bool serializable() const { return serializable_; }
 
 	bool use_image_for_collisions() const { return use_image_for_collisions_; }
+	bool static_object() const { return static_object_; }
 	bool has_feet() const { return has_feet_; }
 	bool adjust_feet_on_animation_change() const { return adjust_feet_on_animation_change_; }
 
@@ -140,11 +146,16 @@ public:
 	const std::map<std::string, variant>& tags() const { return tags_; }
 
 	const std::map<std::string, game_logic::const_formula_ptr>& properties() const { return properties_; }
+	const std::map<std::string, variant>& const_properties() const { return const_properties_; }
 
 	game_logic::function_symbol_table* function_symbols() const;
 
 	const const_solid_info_ptr& solid() const { return solid_; }
 	const const_solid_info_ptr& platform() const { return platform_; }
+
+	const std::vector<int>& platform_offsets() const { return platform_offsets_; }
+
+	bool solid_platform() const { return solid_platform_; }
 
 	//true if the object can ever be solid or standable
 	bool has_solid() const { return has_solid_; }
@@ -158,14 +169,23 @@ public:
 	const_custom_object_type_ptr get_variation(const std::vector<std::string>& variations) const;
 	void load_variations() const;
 
+#ifndef NO_EDITOR
 	const_editor_entity_info_ptr editor_info() const { return editor_info_; }
+#endif // !NO_EDITOR
 
-	wml::const_node_ptr node() const { return node_; }
+	variant node() const { return node_; }
 
 	int activation_border() const { return activation_border_; }
 	const variant& available_frames() const { return available_frames_; }
 
+	bool editor_force_standing() const { return editor_force_standing_; }
+	bool hidden_in_game() const { return hidden_in_game_; }
+
 private:
+	//recreate an object type, optionally given the old version to base
+	//things off where possible
+	static custom_object_type_ptr recreate(const std::string& id, const custom_object_type* old_type);
+
 	custom_object_callable callable_definition_;
 
 	std::string id_;
@@ -173,7 +193,9 @@ private:
 
 	int timer_frequency_;
 
-	typedef std::map<std::string, std::vector<boost::shared_ptr<frame> > > frame_map;
+	typedef boost::shared_ptr<frame> frame_ptr;
+
+	typedef std::map<std::string, std::vector<frame_ptr> > frame_map;
 	frame_map frames_;
 	variant available_frames_;
 
@@ -184,7 +206,7 @@ private:
 	event_handler_map event_handlers_;
 	boost::shared_ptr<game_logic::function_symbol_table> object_functions_;
 
-	boost::scoped_ptr<std::pair<int, int> > parallax_scale_millis_;
+	boost::shared_ptr<std::pair<int, int> > parallax_scale_millis_;
 	
 	int zorder_;
 	int zsub_order_;
@@ -207,9 +229,9 @@ private:
 
 	bool affected_by_currents_;
 
-	std::map<std::string, wml::const_node_ptr> children_;
+	std::map<std::string, variant> children_;
 
-	wml::const_node_ptr node_;
+	variant node_;
 
 	std::map<std::string, const_particle_system_factory_ptr> particle_factories_;
 
@@ -217,7 +239,7 @@ private:
 	int passenger_x_, passenger_y_;
 	int feet_width_;
 
-	bool use_image_for_collisions_;
+	bool use_image_for_collisions_, static_object_;
 
 	bool has_feet_;
 
@@ -227,6 +249,7 @@ private:
 	game_logic::map_formula_callable_ptr consts_;
 	std::map<std::string, variant> tags_;
 
+	std::map<std::string, variant> const_properties_;
 	std::map<std::string, game_logic::const_formula_ptr> properties_;
 
 	int teleport_offset_x_, teleport_offset_y_;
@@ -237,6 +260,8 @@ private:
 
 	const_solid_info_ptr solid_, platform_;
 
+	bool solid_platform_;
+
 	//variable which is true if the object is ever solid or standable
 	bool has_solid_;
 
@@ -245,12 +270,21 @@ private:
 
 	int activation_border_;
 
-	std::map<std::string, wml::const_modifier_ptr> variations_;
+	std::map<std::string, game_logic::const_formula_ptr> variations_;
 	mutable std::map<std::vector<std::string>, const_custom_object_type_ptr> variations_cache_;
 
+#ifndef NO_EDITOR
 	const_editor_entity_info_ptr editor_info_;
+#endif // !NO_EDITOR
 
 	std::map<std::string, const_custom_object_type_ptr> sub_objects_;
+
+	bool editor_force_standing_;
+
+	//object should be hidden in the game but will show in the editor.
+	bool hidden_in_game_;
+
+	std::vector<int> platform_offsets_;
 };
 
 #endif

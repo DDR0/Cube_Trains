@@ -1,7 +1,4 @@
-#include <SDL.h>
-#ifndef SDL_VIDEO_OPENGL_ES
-#include <GL/glew.h>
-#endif
+#include "graphics.hpp"
 
 #include "asserts.hpp"
 #include "preferences.hpp"
@@ -10,8 +7,6 @@
 
 #if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
 #include <EGL/egl.h>
-#include <GLES/gl.h>
-#include <GLES/glext.h>
 #define glGenFramebuffersOES        preferences::glGenFramebuffersOES
 #define glBindFramebufferOES        preferences::glBindFramebufferOES
 #define glFramebufferTexture2DOES   preferences::glFramebufferTexture2DOES
@@ -19,7 +14,7 @@
 #endif
 
 //define macros that make it easy to make the OpenGL calls in this file.
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_OS_IPHONE) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
+#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_OS_IPHONE) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY) || defined(__ANDROID__)
 #define EXT_CALL(call) call##OES
 #define EXT_MACRO(macro) macro##_OES
 #elif defined(__APPLE__)
@@ -51,10 +46,12 @@ bool unsupported()
 
 void init(int buffer_width, int buffer_height)
 {
+	// Clear any old errors.
+	glGetError();
 	frame_buffer_texture_width = buffer_width;
 	frame_buffer_texture_height = buffer_height;
 
-#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY)
+#if defined(TARGET_OS_HARMATTAN) || defined(TARGET_PANDORA) || defined(TARGET_TEGRA) || defined(TARGET_BLACKBERRY) || defined(__ANDROID__)
 	if (glGenFramebuffersOES        != NULL &&
 		glBindFramebufferOES        != NULL &&
 		glFramebufferTexture2DOES   != NULL &&
@@ -81,7 +78,12 @@ void init(int buffer_width, int buffer_height)
 #ifndef TARGET_TEGRA
 	glGetIntegerv(EXT_MACRO(GL_FRAMEBUFFER_BINDING), &video_framebuffer_id);
 #endif
-	ASSERT_EQ(glGetError(), GL_NO_ERROR);
+	// Grab the error code first, because of the side effect in glGetError() of 
+	// clearing the error code and the double call in the ASSERT_EQ() macro we lose
+	// the actual error code.
+	GLenum err = glGetError();
+	ASSERT_EQ(err, GL_NO_ERROR);
+
 	glGenTextures(1, &texture_id);
 	glBindTexture(GL_TEXTURE_2D, texture_id);
 	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -108,7 +110,8 @@ void init(int buffer_width, int buffer_height)
 	// switch back to window-system-provided framebuffer
 	EXT_CALL(glBindFramebuffer)(EXT_MACRO(GL_FRAMEBUFFER), video_framebuffer_id);
 
-	ASSERT_EQ(glGetError(), GL_NO_ERROR);
+	err = glGetError();
+	ASSERT_EQ(err, GL_NO_ERROR);
 }
 
 render_scope::render_scope()

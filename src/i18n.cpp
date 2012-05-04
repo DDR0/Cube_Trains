@@ -4,6 +4,7 @@
 #include "stdint.h"
 
 #include "filesystem.hpp"
+#include "module.hpp"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
@@ -15,6 +16,12 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#endif
+
+#ifdef TARGET_BLACKBERRY
+#include "bps/bps.h"
+#include "bps/locale.h"
+#include <sstream>
 #endif
 
 namespace {
@@ -86,10 +93,21 @@ const std::string& get_locale() {
 		}
 #endif
 
-#ifdef TARGET_OS_HARMATTAN
+#if defined(TARGET_OS_HARMATTAN)
 	std::cerr << "Get GConf default client\n";
 	GConfClient *gconf = gconf_client_get_default();
 	locale = std::string(gconf_client_get_string(gconf, "/meegotouch/i18n/region", NULL));
+#elif defined(TARGET_BLACKBERRY)
+	char *language = 0;
+	char *country = 0;
+	if (BPS_SUCCESS == locale_get(&language, &country) && language!= NULL && country != NULL) {
+		std::stringstream ss;
+		ss << language << "_" << country;
+		locale = ss.str();
+
+		bps_free(language);
+		bps_free(country);
+	}
 #else
 	char *cstr = getenv("LANG");
 	if (cstr != NULL)
@@ -127,7 +145,7 @@ const std::string& get_locale() {
 	}
 	if (!sys::file_exists(filename))
 		return;
-	const std::string content = sys::read_file(filename);
+	const std::string content = sys::read_file(module::map_file(filename));
 	size_t size = content.size();
 	if (size < sizeof(mo_header))
 		return;
