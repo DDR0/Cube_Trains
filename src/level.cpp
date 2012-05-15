@@ -2355,6 +2355,22 @@ bool level::solid(const entity& e, const std::vector<point>& points, const surfa
 	return is_solid(solid_, e, points, info);
 }
 
+bool level::solid(int xbegin, int ybegin, int w, int h, const surface_info** info) const
+{
+	const int xend = xbegin + w;
+	const int yend = ybegin + h;
+
+	for(int y = ybegin; y != yend; ++y) {
+		for(int x = xbegin; x != xend; ++x) {
+			if(solid(x, y, info)) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 bool level::solid(const rect& r, const surface_info** info) const
 {
 	//TODO: consider optimizing this function.
@@ -3063,7 +3079,7 @@ variant level::get_value_by_slot(int slot) const
 	case LEVEL_LOCAL_PLAYER:
 		return variant(player_.get());
 	case LEVEL_NUM_ACTIVE:
-		return variant(active_chars_.size());
+		return variant(unsigned(active_chars_.size()));
 	case LEVEL_ACTIVE_CHARS: {
 		std::vector<variant> v;
 		foreach(const entity_ptr& e, active_chars_) {
@@ -3142,7 +3158,7 @@ variant level::get_value(const std::string& key) const
 	} else if(key == "local_player") {
 		return variant(player_.get());
 	} else if(key == "num_active") {
-		return variant(active_chars_.size());
+		return variant(unsigned(active_chars_.size()));
 	} else if(key == "active_chars") {
 		std::vector<variant> v;
 		foreach(const entity_ptr& e, active_chars_) {
@@ -3203,7 +3219,7 @@ variant level::get_value(const std::string& key) const
 	} else if(key == "segment_height") {
 		return variant(segment_height_);
 	} else if(key == "num_segments") {
-		return variant(sub_levels_.size());
+		return variant(unsigned(sub_levels_.size()));
 	} else if(key == "camera_position") {
 		std::vector<variant> pos;
 		pos.reserve(4);

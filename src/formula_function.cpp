@@ -12,11 +12,13 @@
    See the COPYING file for more details.
 */
 
+#include <boost/bind.hpp>
 #include <iostream>
 #include <stack>
 #include <math.h>
 
 #include "asserts.hpp"
+#include "compress.hpp"
 #include "foreach.hpp"
 #include "formatter.hpp"
 #include "formula.hpp"
@@ -25,9 +27,14 @@
 #include "formula_callable_utils.hpp"
 #include "formula_function.hpp"
 #include "formula_function_registry.hpp"
+#include "geometry.hpp"
 #include "string_utils.hpp"
 #include "unit_test.hpp"
 #include "variant_callable.hpp"
+#include "controls.hpp"
+#include "pathfinding.hpp"
+#include "level.hpp"
+#include "json_parser.hpp"
 
 #include "graphics.hpp"
 #include "module.hpp"
@@ -203,6 +210,23 @@ FUNCTION_DEF(delay_until_end_of_loading, 1, 1, "delay_until_end_of_loading(strin
 
 	return variant::create_delayed(f, callable);
 END_FUNCTION_DEF(delay_until_end_of_loading)
+
+FUNCTION_DEF(eval, 1, 1, "eval(str): evaluate the given string as FFL")
+	variant s = args()[0]->evaluate(variables);
+	try {
+		const assert_recover_scope recovery_scope;
+		const_formula_ptr f(formula::create_optional_formula(s));
+		if(!f) {
+			return variant();
+		}
+
+		return f->execute(variables);
+	} catch(type_error&) {
+	} catch(validation_failure_exception&) {
+	}
+	std::cerr << "ERROR IN EVAL\n";
+	return variant();
+END_FUNCTION_DEF(eval)
 
 FUNCTION_DEF(switch, 3, -1, "switch(value, case1, result1, case2, result2 ... casen, resultn, default) -> value: returns resultn where value = casen, or default otherwise.")
 	variant var = args()[0]->evaluate(variables);
@@ -439,7 +463,7 @@ FUNCTION_DEF(orbit, 4, 4, "orbit(x, y, angle, dist) -> [x,y]: Returns the point 
 END_FUNCTION_DEF(orbit)
 
 FUNCTION_DEF(regex_replace, 3, 3, "regex_replace(string, string, string) -> string: Unknown.")
-	std::string str = args()[0]->evaluate(variables).as_string();
+	const std::string str = args()[0]->evaluate(variables).as_string();
 	const boost::regex re(args()[1]->evaluate(variables).as_string());
 	const std::string value = args()[2]->evaluate(variables).as_string();
 	return variant(boost::regex_replace(str, re, value));
@@ -491,6 +515,142 @@ FUNCTION_DEF(zipWith, 3, 3, "zipWith(list1, list2, expr) -> list")
 	return variant(&retList);
 END_FUNCTION_DEF(zipWith)
 
+/* XXX Krista to be reworked
+FUNCTION_DEF(update_controls, 1, 1, "update_controls(map) : Updates the controls based on a list of id:string, pressed:bool pairs")
+	const variant map = args()[0]->evaluate(variables);
+	foreach(const variant_pair& p, map.as_map()) {
+		std::cerr << "Button: " << p.first.as_string() << " " << (p.second.as_bool() ? "Pressed" : "Released") << std::endl;
+		controls::update_control_state(p.first.as_string(), p.second.as_bool());
+	}
+	return variant();
+END_FUNCTION_DEF(update_controls)
+
+FUNCTION_DEF(map_controls, 1, 1, "map_controls(map) : Creates or updates the mapping on controls to keys")
+	const variant map = args()[0]->evaluate(variables);
+	foreach(const variant_pair& p, map.as_map()) {
+		controls::set_mapped_key(p.first.as_string(), static_cast<SDLKey>(p.second.as_int()));
+	}
+	return variant();
+END_FUNCTION_DEF(map_controls)*/
+
+FUNCTION_DEF(directed_graph, 2, 2, "directed_graph(list_of_vertexes, adjacent_expression) -> a directed graph")
+	variant vertices = args()[0]->evaluate(variables);
+	pathfinding::graph_edge_list edges;
+	
+	std::vector<variant> vertex_list;
+	boost::intrusive_ptr<map_formula_callable> callable(new map_formula_callable(&variables));
+	variant& a = callable->add_direct_access("v");
+	foreach(variant v, vertices.as_list()) {
+		a = v;
+		edges[v] = args()[1]->evaluate(*callable).as_list();
+		vertex_list.push_back(v);
+	}
+	pathfinding::directed_graph* dg = new pathfinding::directed_graph(&vertex_list, &edges);
+	return variant(dg);
+END_FUNCTION_DEF(directed_graph)
+
+FUNCTION_DEF(weighted_graph, 2, 2, "weighted_graph(directed_graph, weight_expression) -> a weighted directed graph")
+	variant graph = args()[0]->evaluate(variables);
+	pathfinding::directed_graph_ptr dg = boost::intrusive_ptr<pathfinding::directed_graph>(graph.try_convert<pathfinding::directed_graph>());
+	ASSERT_LOG(dg, "Directed graph given is not of the correct type.");
+	pathfinding::edge_weights w;
+	boost::intrusive_ptr<map_formula_callable> callable(new map_formula_callable(&variables));
+	variant& a = callable->add_direct_access("a");
+	variant& b = callable->add_direct_access("b");
+	for(pathfinding::graph_edge_list::const_iterator edges = dg->get_edges()->begin(); 
+		edges != dg->get_edges()->end(); 
+		edges++) {
+		foreach(const variant e2, edges->second) {
+			a = edges->first;
+			b = e2;
+			w[pathfinding::graph_edge(edges->first, e2)] = args()[1]->evaluate(*callable).as_decimal();
+		}
+	}
+	return variant(new pathfinding::weighted_directed_graph(dg, &w));
+END_FUNCTION_DEF(weighted_graph)
+
+FUNCTION_DEF(a_star_search, 4, 4, "a_star_search(weighted_directed_graph, src_node, dst_node, heuristic) -> A list of nodes which represents the 'best' path from src_node to dst_node.")
+	variant graph = args()[0]->evaluate(variables);
+	pathfinding::weighted_directed_graph_ptr wg = graph.try_convert<pathfinding::weighted_directed_graph>();
+	ASSERT_LOG(wg, "Weighted graph given is not of the correct type.");
+	variant src_node = args()[1]->evaluate(variables);
+	variant dst_node = args()[2]->evaluate(variables);
+	expression_ptr heuristic = args()[3];
+	boost::intrusive_ptr<map_formula_callable> callable(new map_formula_callable(&variables));
+	return pathfinding::a_star_search(wg, src_node, dst_node, heuristic, callable);
+END_FUNCTION_DEF(a_star_search)
+
+FUNCTION_DEF(path_cost_search, 3, 3, "cost_search(weighted_directed_graph, src_node, max_cost) -> A list of all possible points reachable from src_node within max_cost.")
+	variant graph = args()[0]->evaluate(variables);
+	pathfinding::weighted_directed_graph_ptr wg = graph.try_convert<pathfinding::weighted_directed_graph>();
+	ASSERT_LOG(wg, "Weighted graph given is not of the correct type.");
+	variant src_node = args()[1]->evaluate(variables);
+	decimal max_cost(args()[2]->evaluate(variables).as_decimal());
+	return pathfinding::path_cost_search(wg, src_node, max_cost);
+END_FUNCTION_DEF(path_cost_search)
+
+FUNCTION_DEF(create_graph_from_level, 1, 3, "create_graph_from_level(level, (optional) tile_size_x, (optional) tile_size_y) -> directed graph : Creates a directed graph based on the current level.")
+	int tile_size_x = TileSize;
+	int tile_size_y = TileSize;
+	if(args().size() == 2) {
+		tile_size_y = tile_size_x = args()[1]->evaluate(variables).as_int();
+	} else if(args().size() == 3) {
+		tile_size_x = args()[1]->evaluate(variables).as_int();
+		tile_size_y = args()[2]->evaluate(variables).as_int();
+	}
+	ASSERT_LOG((tile_size_x%2)==0 && (tile_size_y%2)==0, "The tile_size_x and tile_size_y values *must* be even. (" << tile_size_x << "," << tile_size_y << ")");
+	variant curlevel = args()[0]->evaluate(variables);
+	level_ptr lvl = curlevel.try_convert<level>();
+	ASSERT_LOG(lvl, "The level parameter passed to the function was couldn't be converted.");
+	rect b = lvl->boundaries();
+	b.from_coordinates(b.x() - b.x()%tile_size_x, 
+		b.y() - b.y()%tile_size_y, 
+		b.x2()+(tile_size_x-b.x2()%tile_size_x), 
+		b.y2()+(tile_size_y-b.y2()%tile_size_y));
+
+	pathfinding::graph_edge_list edges;
+	std::vector<variant> vertex_list;
+
+	for(int y = b.y(); y < b.y2(); y += tile_size_y) {
+		for(int x = b.x(); x < b.x2(); x += tile_size_x) {
+			if(!lvl->solid(x, y, tile_size_x, tile_size_y)) {
+				variant l(pathfinding::point_as_variant_list(point(x,y)));
+				vertex_list.push_back(l);
+				std::vector<variant> e;
+				foreach(const point& p, pathfinding::get_neighbours_from_rect(x, y, tile_size_x, tile_size_y)) {
+					if(!lvl->solid(p.x, p.y, tile_size_x, tile_size_y)) {
+						e.push_back(pathfinding::point_as_variant_list(p));
+					}
+				}
+				edges[l] = e;
+			}
+		}
+	}
+	return variant(new pathfinding::directed_graph(&vertex_list, &edges));
+END_FUNCTION_DEF(create_graph_from_level)
+
+FUNCTION_DEF(plot_path, 6, 9, "plot_path(level, from_x, from_y, to_x, to_y, heuristic, (optional) weight_expr, (optional) tile_size_x, (optional) tile_size_y) -> list : Returns a list of points to get from (from_x, from_y) to (to_x, to_y)")
+	int tile_size_x = TileSize;
+	int tile_size_y = TileSize;
+	expression_ptr weight_expr = expression_ptr();
+	variant curlevel = args()[0]->evaluate(variables);
+	level_ptr lvl = curlevel.try_convert<level>();
+	if(args().size() > 6) {
+		weight_expr = args()[6];
+	}
+	if(args().size() == 8) {
+		tile_size_y = tile_size_x = args()[6]->evaluate(variables).as_int();
+	} else if(args().size() == 9) {
+		tile_size_x = args()[6]->evaluate(variables).as_int();
+		tile_size_y = args()[7]->evaluate(variables).as_int();
+	}
+	ASSERT_LOG((tile_size_x%2)==0 && (tile_size_y%2)==0, "The tile_size_x and tile_size_y values *must* be even. (" << tile_size_x << "," << tile_size_y << ")");
+	point src(args()[1]->evaluate(variables).as_int(), args()[2]->evaluate(variables).as_int());
+	point dst(args()[3]->evaluate(variables).as_int(), args()[4]->evaluate(variables).as_int());
+	expression_ptr heuristic = args()[4];
+	boost::intrusive_ptr<map_formula_callable> callable(new map_formula_callable(&variables));
+	return variant(pathfinding::a_star_find_path(lvl, src, dst, heuristic, weight_expr, callable, tile_size_x, tile_size_y));
+END_FUNCTION_DEF(plot_path)
 
 namespace {
 class variant_comparator : public formula_callable {
@@ -656,7 +816,7 @@ END_FUNCTION_DEF(shuffle)
 				variant& index_var = self_callable->add_direct_access("index");
 				for(size_t n = 0; n != items.num_elements(); ++n) {
 					item_var = items[n];
-					index_var = variant(n);
+					index_var = variant(unsigned(n));
 					formula_callable_ptr callable_with_backup(new formula_variant_callable_with_backup(items[n], variables));
 					formula_callable_ptr callable_ptr(new formula_callable_with_backup(*self_callable, *callable_with_backup));
 					const variant val = args()[2]->evaluate(*callable_ptr);
@@ -782,7 +942,7 @@ END_FUNCTION_DEF(shuffle)
 
 			const int nitems = items.num_elements();
 			for(size_t n = 0; n != nitems; ++n) {
-				callable->set(items[n], variant(n));
+				callable->set(items[n], variant(unsigned(n)));
 				const variant val = args().back()->evaluate(*callable);
 				vars.push_back(val);
 			}
@@ -989,7 +1149,34 @@ FUNCTION_DEF(get_files_in_dir, 1, 1, "Returns a list of the files in the given d
 	return variant(&v);
 END_FUNCTION_DEF(get_files_in_dir)
 
+namespace {
+void evaluate_expr_for_benchmark(const formula_expression* expr, const formula_callable* variables, int ntimes)
+{
+	for(int n = 0; n < ntimes; ++n) {
+		expr->evaluate(*variables);
+	}
+}
 
+}
+
+FUNCTION_DEF(benchmark, 1, 1, "benchmark(expr): Executes expr in a benchmark harness and returns a string describing its benchmark performance")
+	return variant(test::run_benchmark("benchmark", boost::bind(evaluate_expr_for_benchmark, args()[0].get(), &variables, _1)));
+END_FUNCTION_DEF(benchmark)
+
+FUNCTION_DEF(compress, 1, 2, "compress(string, (optional) compression_level): Compress the given string object")
+	int compression_level = -1;
+	if(args().size() > 1) {
+		compression_level = args()[1]->evaluate(variables).as_int();
+	}
+	const std::string& s = args()[0]->evaluate(variables).as_string();
+	return variant(new zip::compressed_data(std::vector<char>(s.begin(), s.end()), compression_level));
+END_FUNCTION_DEF(compress)
+
+FUNCTION_DEF(decompress, 1, 1, "decompress(expr): Tries to decompress the given object, returns the data if successful.")
+	variant compressed = args()[0]->evaluate(variables);
+	zip::compressed_data_ptr cd = boost::intrusive_ptr<zip::compressed_data>(compressed.try_convert<zip::compressed_data>());
+	return cd->get_value("decompress");
+END_FUNCTION_DEF(decompress)
 
 	class size_function : public function_expression {
 	public:
@@ -1269,12 +1456,14 @@ public:
 	virtual void execute(game_logic::formula_callable& ob) const {
 		if(target_.is_callable()) {
 			target_.mutable_callable()->mutate_value(attr_, val_);
+		} else if(target_.is_map()) {
+			target_.add_attr_mutation(variant(attr_), val_);
 		} else {
 			ob.mutate_value(attr_, val_);
 		}
 	}
 private:
-	variant target_;
+	mutable variant target_;
 	std::string attr_;
 	variant val_;
 };
@@ -1288,12 +1477,15 @@ public:
 	virtual void execute(game_logic::formula_callable& ob) const {
 		if(target_.is_callable()) {
 			target_.mutable_callable()->mutate_value(attr_, target_.mutable_callable()->query_value(attr_) + val_);
+		} else if(target_.is_map()) {
+			variant key(attr_);
+			target_.add_attr_mutation(key, target_[key] + val_);
 		} else {
 			ob.mutate_value(attr_, ob.query_value(attr_) + val_);
 		}
 	}
 private:
-	variant target_;
+	mutable variant target_;
 	std::string attr_;
 	variant val_;
 };
@@ -1794,7 +1986,7 @@ UNIT_TEST(map_function) {
 
 UNIT_TEST(where_scope_function) {
 	CHECK(game_logic::formula(variant("{'val': num} where num = 5")).execute() == game_logic::formula(variant("{'val': 5}")).execute(), "map where test failed");
-	CHECK(game_logic::formula(variant("'five: {five}' where five = 5")).execute() == game_logic::formula(variant("'five: 5'")).execute(), "string where test failed");
+	CHECK(game_logic::formula(variant("'five: ${five}' where five = 5")).execute() == game_logic::formula(variant("'five: 5'")).execute(), "string where test failed");
 }
 
 BENCHMARK(map_function) {

@@ -59,9 +59,6 @@ public:
 		}
 	}
 
-	// function which will create a formula that is a single string literal, 'str'.
-	// 'str' should not be enclosed in quotes.
-	static formula_ptr create_string_formula(const std::string& str);
 	static formula_ptr create_optional_formula(const variant& str, function_symbol_table* symbols=NULL, const formula_callable_definition* def=NULL);
 	explicit formula(const variant& val, function_symbol_table* symbols=NULL, const formula_callable_definition* def=NULL);
 	~formula();
@@ -70,7 +67,7 @@ public:
 	std::string str() const { return str_.as_string(); }
 	variant str_var() const { return str_; }
 
-	void output_debug_info() const;
+	std::string output_debug_info() const;
 
 	bool has_guards() const { return base_expr_.empty() == false; }
 	int guard_matches(const formula_callable& variables) const;

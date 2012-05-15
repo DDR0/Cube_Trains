@@ -41,7 +41,6 @@
 #include "module.hpp"
 #include "multiplayer.hpp"
 #include "object_events.hpp"
-#include "package.hpp"
 #include "player_info.hpp"
 #include "preferences.hpp"
 #include "property_editor_dialog.hpp"
@@ -224,7 +223,7 @@ class editor_menu_dialog : public gui::dialog
 	std::string code_button_text_;
 public:
 	explicit editor_menu_dialog(editor& e)
-	  : gui::dialog(0, 0, preferences::actual_screen_width() - EDITOR_SIDEBAR_WIDTH, EDITOR_MENUBAR_HEIGHT), editor_(e)
+	  : gui::dialog(0, 0, e.xres() ? e.xres() : 1200, EDITOR_MENUBAR_HEIGHT), editor_(e)
 	{
 		set_clear_bg_amount(255);
 		init();
@@ -281,7 +280,7 @@ public:
 
 		code_button_ = button_ptr(new button(text, boost::bind(&editor::toggle_code, &editor_)));
 
-		add_widget(code_button_, graphics::screen_width() - 612, 4);
+		add_widget(code_button_, (editor_.xres() ? editor_.xres() : 1200) - 612, 4);
 	}
 
 
@@ -297,10 +296,18 @@ public:
 		std::string name = entry->text();
 		if(name.empty() == false) {
 			variant empty_lvl = json::parse_from_file("data/level/empty.cfg");
-			empty_lvl.add_attr(variant("id"), variant(name));
-			sys::write_file(preferences::level_path() + name, empty_lvl.write_json());
+			std::string id = module::make_module_id(name);
+			empty_lvl.add_attr(variant("id"), variant(id));
+			if(preferences::is_level_path_set()) {
+				sys::write_file(preferences::level_path() + name, empty_lvl.write_json());
+			} else {
+				std::string nn = module::get_id(name);
+				std::string modname = module::get_module_id(name);
+				sys::write_file(module::get_module_path(modname) + preferences::level_path() + nn, empty_lvl.write_json());
+			}
+			loadlevel::load_level_paths();
 			editor_.close();
-			g_last_edited_level() = name;
+			g_last_edited_level() = id;
 		}
 	}
 
@@ -677,7 +684,7 @@ void editor::edit(const char* level_cfg, int xpos, int ypos)
 		e->ypos_ = ypos;
 	}
 
-	editor_resolution_manager resolution_manager;
+	editor_resolution_manager resolution_manager(e->xres(), e->yres());
 
 	e->setup_for_editing();
 	e->edit_level();
@@ -716,7 +723,8 @@ editor::editor(const char* level_cfg)
 	cur_tileset_(0), cur_object_(0),
     current_dialog_(NULL),
 	drawing_rect_(false), dragging_(false), level_changed_(0),
-	selected_segment_(-1), prev_mousex_(-1), prev_mousey_(-1)
+	selected_segment_(-1), prev_mousex_(-1), prev_mousey_(-1),
+	xres_(0), yres_(0)
 {
 	preferences::set_record_history(true);
 
@@ -727,6 +735,13 @@ editor::editor(const char* level_cfg)
 		tileset::init(editor_cfg);
 		enemy_type::init(editor_cfg);
 		first_time = false;
+		if(editor_cfg.is_map()) {
+			if(editor_cfg["resolution"].is_null() == false) {
+				std::vector<int> v = editor_cfg["resolution"].as_list_int();
+				xres_ = v[0];
+				yres_ = v[1];
+			}
+		}
 	}
 
 	assert(!tilesets.empty());
@@ -868,12 +883,17 @@ bool editor_resolution_manager::is_active()
 	return editor_resolution_manager_count != 0;
 }
 
-editor_resolution_manager::editor_resolution_manager() :
+editor_resolution_manager::editor_resolution_manager(int xres, int yres) :
 	   original_width_(preferences::actual_screen_width()),
 	   original_height_(preferences::actual_screen_height()) {
 	if(!editor_x_resolution) {
-		editor_x_resolution = 1200; //preferences::actual_screen_width() + EDITOR_SIDEBAR_WIDTH + editor_dialogs::LAYERS_DIALOG_WIDTH;
-		editor_y_resolution = preferences::actual_screen_height() + EDITOR_MENUBAR_HEIGHT;
+		if(xres != 0 && yres != 0) {
+			editor_x_resolution = xres;
+			editor_y_resolution = yres;
+		} else {
+			editor_x_resolution = 1200; //preferences::actual_screen_width() + EDITOR_SIDEBAR_WIDTH + editor_dialogs::LAYERS_DIALOG_WIDTH;
+			editor_y_resolution = preferences::actual_screen_height() + EDITOR_MENUBAR_HEIGHT;
+		}
 	}
 
 	if(++editor_resolution_manager_count == 1) {
@@ -2578,11 +2598,17 @@ void editor::change_tool(EDIT_TOOL tool)
 
 void editor::save_level_as(const std::string& fname)
 {
+	const std::string id = module::make_module_id(fname);
 	all_editors.erase(filename_);
-	all_editors[fname] = this;
-	filename_ = fname;
+	all_editors[id] = this;
+
+	std::string path = module::get_id(fname);
+	std::string modname = module::get_module_id(fname);
+	sys::write_file(module::get_module_path(modname) + preferences::level_path() + path, "");
+	loadlevel::load_level_paths();
+	filename_ = id;
 	save_level();
-	g_last_edited_level() = filename_;
+	g_last_edited_level() = id;
 }
 
 void editor::quit()
@@ -2661,7 +2687,11 @@ void editor::save_level()
 								   //all levels start at cycle 0.
 	lvl_node = variant(&attr);
 	std::cerr << "GET LEVEL FILENAME: " << filename_ << "\n";
-	sys::write_file(module::map_file(package::get_level_filename(filename_)), lvl_node.write_json(true));
+	if(preferences::is_level_path_set()) {
+		sys::write_file(preferences::level_path() + filename_, lvl_node.write_json(true));
+	} else {
+		sys::write_file(loadlevel::get_level_path(filename_), lvl_node.write_json(true));
+	}
 
 	//see if we should write the next/previous levels also
 	//based on them having changed.
@@ -2671,7 +2701,11 @@ void editor::save_level()
 			prev->finish_loading();
 			if(prev->next_level() != lvl_->id()) {
 				prev->set_next_level(lvl_->id());
-				sys::write_file(module::map_file(package::get_level_filename(prev->id())), prev->write().write_json(true));
+				if(preferences::is_level_path_set()) {
+					sys::write_file(preferences::level_path() + prev->id(), prev->write().write_json(true));
+				} else {
+					sys::write_file(module::map_file(prev->id()), prev->write().write_json(true));
+				}
 			}
 		} catch(...) {
 		}
@@ -2683,7 +2717,11 @@ void editor::save_level()
 			next->finish_loading();
 			if(next->previous_level() != lvl_->id()) {
 				next->set_previous_level(lvl_->id());
-				sys::write_file(module::map_file(package::get_level_filename(next->id())), next->write().write_json(true));
+				if(preferences::is_level_path_set()) {
+					sys::write_file(preferences::level_path() + next->id(), next->write().write_json(true));
+				} else {
+					sys::write_file(module::map_file(next->id()), next->write().write_json(true));
+				}
 			}
 		} catch(...) {
 		}

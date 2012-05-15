@@ -13,6 +13,10 @@ namespace game_logic {
 class formula_callable;
 }
 
+#ifdef _WINDOWS
+std::string GetAppDataPath();
+#endif
+
 namespace preferences {
 
 	const std::string& version();
@@ -23,10 +27,12 @@ namespace preferences {
 	bool no_music();
 
 	void set_preferences_path(const std::string& path);
+	void set_preferences_path_from_module( const std::string& name);
 
 	bool setup_preferences_dir();
 
 	const std::string& level_path();
+	bool is_level_path_set();
 	const char* user_data_path();
 	const char* save_file_path();
 	const char* auto_save_file_path();

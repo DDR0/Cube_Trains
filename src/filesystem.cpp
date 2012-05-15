@@ -128,7 +128,7 @@ DIR *opendir(char const *name)
 	// Must be a valid name
 	if( !name ||
 		!*name ||
-		(dwAttr = GetFileAttributes(name)) == 0xFFFFFFFF)
+		(dwAttr = GetFileAttributesA(name)) == 0xFFFFFFFF)
 	{
 		errno = ENOENT;
 	}
@@ -370,7 +370,8 @@ void get_files_in_dir(const std::string& directory,
 }
 
 void get_unique_filenames_under_dir(const std::string& dir,
-                                    std::map<std::string, std::string>* file_map)
+                                    std::map<std::string, std::string>* file_map,
+									const std::string& prefix)
 {
 	if(dir.size() > 1024) {
 		return;
@@ -381,12 +382,12 @@ void get_unique_filenames_under_dir(const std::string& dir,
 	get_files_in_dir(dir, &files, &dirs);
 	for(std::vector<std::string>::const_iterator i = files.begin();
 	    i != files.end(); ++i) {
-		(*file_map)[*i] = dir + "/" + *i;
+		(*file_map)[prefix + *i] = dir + "/" + *i;
 	}
 
 	for(std::vector<std::string>::const_iterator i = dirs.begin();
 	    i != dirs.end(); ++i) {
-		get_unique_filenames_under_dir(dir + "/" + *i, file_map);
+		get_unique_filenames_under_dir(dir + "/" + *i, file_map, prefix);
 	}
 }
 
@@ -584,6 +585,16 @@ void write_file(const std::string& fname, const std::string& data)
 	//Write the file.
 	std::ofstream file(fname.c_str(),std::ios_base::binary);
 	file << data;
+}
+
+void move_file(const std::string& from, const std::string& to)
+{
+	rename(from.c_str(), to.c_str());
+}
+
+void remove_file(const std::string& fname)
+{
+	unlink(fname.c_str());
 }
 
 }

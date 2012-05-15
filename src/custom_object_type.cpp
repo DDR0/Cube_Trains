@@ -233,7 +233,7 @@ variant custom_object_type::merge_prototype(variant node)
 
 	foreach(const std::string& proto, protos) {
 		//look up the object's prototype and merge it in
-		std::map<std::string, std::string>::const_iterator path_itor = prototype_file_paths().find(proto + ".cfg");
+		std::map<std::string, std::string>::const_iterator path_itor = module::find(prototype_file_paths(), proto + ".cfg");
 		ASSERT_LOG(path_itor != prototype_file_paths().end(), "Could not find file for prototype '" << proto << "'");
 
 		variant prototype_node = json::parse_from_file(path_itor->second);
@@ -250,7 +250,7 @@ const std::string* custom_object_type::get_object_path(const std::string& id)
 		load_file_paths();
 	}
 
-	std::map<std::string, std::string>::const_iterator itor = object_file_paths().find(id);
+	std::map<std::string, std::string>::const_iterator itor = module::find(object_file_paths(), id);
 	if(itor == object_file_paths().end()) {
 		return NULL;
 	}
@@ -316,13 +316,13 @@ custom_object_type_ptr custom_object_type::recreate(const std::string& id,
 	}
 
 	//find the file for the object we are loading.
-	std::map<std::string, std::string>::const_iterator path_itor = object_file_paths().find(id + ".cfg");
+	std::map<std::string, std::string>::const_iterator path_itor = module::find(object_file_paths(), id + ".cfg");
 	ASSERT_LOG(path_itor != object_file_paths().end(), "Could not find file for object '" << id << "'");
 
 	try {
 		variant node = merge_prototype(json::parse_from_file(path_itor->second));
 
-		ASSERT_LOG(node["id"].as_string() == id, "IN " << path_itor->second << " OBJECT ID DOES NOT MATCH FILENAME");
+		ASSERT_LOG(node["id"].as_string() == module::get_id(id), "IN " << path_itor->second << " OBJECT ID DOES NOT MATCH FILENAME");
 
 		//create the object
 		custom_object_type_ptr result(new custom_object_type(node, NULL, old_type));
@@ -380,8 +380,10 @@ int custom_object_type::reload_modified_code()
 			mod_itor->second = mod_time;
 			std::cerr << "FILE MODIFIED: " << i->first << " -> " << *path << ": " << mod_time << " VS " << mod_itor->second << "\n";
 
-			if(reload_object(i->first)) {
+			try {
+				reload_object(i->first);
 				++result;
+			} catch(...) {
 			}
 		}
 	}
@@ -389,26 +391,23 @@ int custom_object_type::reload_modified_code()
 	return result;
 }
 
-bool custom_object_type::set_file_contents(const std::string& file_path, const std::string& contents)
+void custom_object_type::set_file_contents(const std::string& file_path, const std::string& contents)
 {
 	json::set_file_contents(file_path, contents);
 	for(object_map::iterator i = cache().begin(); i != cache().end(); ++i) {
 		const std::string* path = get_object_path(i->first + ".cfg");
 		if(path && *path == file_path) {
-			if(!reload_object(i->first)) {
-				return false;
-			}
+			reload_object(i->first);
+			return;
 		}
 	}
-
-	return true;
 }
 
 namespace {
 int g_num_object_reloads = 0;
 }
 
-bool custom_object_type::reload_object(const std::string& type)
+void custom_object_type::reload_object(const std::string& type)
 {
 	object_map::iterator itor = cache().find(type);
 	ASSERT_LOG(itor != cache().end(), "COULD NOT RELOAD OBJECT " << type);
@@ -418,45 +417,36 @@ bool custom_object_type::reload_object(const std::string& type)
 	custom_object_type_ptr new_obj;
 	
 	const int begin = SDL_GetTicks();
-	try {
+	{
 		const assert_recover_scope scope;
 		new_obj = recreate(type, old_obj.get());
 		std::cerr << "RELOADED OBJECT IN " << (SDL_GetTicks() - begin) << "ms\n";
-	} catch(validation_failure_exception& e) {
-		std::cerr << "FAILURE TO LOAD IN " << (SDL_GetTicks() - begin) << "ms\n";
-		return false;
-	} catch(...) {
-		std::cerr << "UNKNOWN FAILURE TO LOAD IN " << (SDL_GetTicks() - begin) << "ms\n";
-		return false;
 	}
 
+	if(!new_obj) {
+		return;
+	}
 
-	if(new_obj) {
-		const int start = SDL_GetTicks();
-		foreach(custom_object* obj, custom_object::get_all(old_obj->id())) {
-			obj->update_type(old_obj, new_obj);
-		}
+	const int start = SDL_GetTicks();
+	foreach(custom_object* obj, custom_object::get_all(old_obj->id())) {
+		obj->update_type(old_obj, new_obj);
+	}
 
-		for(std::map<std::string, const_custom_object_type_ptr>::const_iterator i = old_obj->sub_objects_.begin(); i != old_obj->sub_objects_.end(); ++i) {
-			std::map<std::string, const_custom_object_type_ptr>::const_iterator j = new_obj->sub_objects_.find(i->first);
-			if(j != new_obj->sub_objects_.end() && i->second != j->second) {
-				foreach(custom_object* obj, custom_object::get_all(i->second->id())) {
-					obj->update_type(i->second, j->second);
-				}
+	for(std::map<std::string, const_custom_object_type_ptr>::const_iterator i = old_obj->sub_objects_.begin(); i != old_obj->sub_objects_.end(); ++i) {
+		std::map<std::string, const_custom_object_type_ptr>::const_iterator j = new_obj->sub_objects_.find(i->first);
+		if(j != new_obj->sub_objects_.end() && i->second != j->second) {
+			foreach(custom_object* obj, custom_object::get_all(i->second->id())) {
+				obj->update_type(i->second, j->second);
 			}
 		}
-
-		const int end = SDL_GetTicks();
-		std::cerr << "UPDATED " << custom_object::get_all(old_obj->id()).size() << " OBJECTS IN " << (end - start) << "ms\n";
-
-		itor->second = new_obj;
-
-		++g_num_object_reloads;
-
-		return true;
 	}
 
-	return false;
+	const int end = SDL_GetTicks();
+	std::cerr << "UPDATED " << custom_object::get_all(old_obj->id()).size() << " OBJECTS IN " << (end - start) << "ms\n";
+
+	itor->second = new_obj;
+
+	++g_num_object_reloads;
 }
 
 int custom_object_type::num_object_reloads()

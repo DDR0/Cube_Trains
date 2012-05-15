@@ -8,6 +8,7 @@
 #include "achievements.hpp"
 #include "asserts.hpp"
 #include "blur.hpp"
+#include "clipboard.hpp"
 #include "collision_utils.hpp"
 #include "controls.hpp"
 #include "current_generator.hpp"
@@ -55,11 +56,37 @@ namespace {
 const std::string FunctionModule = "custom_object";
 
 FUNCTION_DEF(time, 0, 0, "time() -> timestamp: returns the current real time")
-	rng::generate(); //this is to make the engine optimisation leave this function alone.
+	formula::fail_if_static_context();
 	time_t t1;
 	time(&t1);
 	return variant(static_cast<int>(t1));
 END_FUNCTION_DEF(time)
+
+FUNCTION_DEF(performance, 0, 0, "performance(): returns an object with current performance stats")
+	formula::fail_if_static_context();
+	return variant(performance_data::current());
+END_FUNCTION_DEF(performance)
+
+FUNCTION_DEF(get_clipboard_text, 0, 0, "get_clipboard_text(): returns the text currentl in the windowing clipboard")
+	formula::fail_if_static_context();
+	return variant(copy_from_clipboard(false));
+END_FUNCTION_DEF(get_clipboard_text)
+
+class set_clipboard_text_command : public game_logic::command_callable
+{
+	std::string str_;
+public:
+	explicit set_clipboard_text_command(const std::string& str) : str_(str)
+	{}
+
+	virtual void execute(game_logic::formula_callable& ob) const {
+		copy_to_clipboard(str_, false);
+	}
+};
+
+FUNCTION_DEF(set_clipboard_text, 1, 1, "set_clipboard_text(str): sets the clipboard text to the given string")
+	return variant(new set_clipboard_text_command(args()[0]->evaluate(variables).as_string()));
+END_FUNCTION_DEF(set_clipboard_text)
 
 class report_command : public entity_command_callable
 {
@@ -683,6 +710,23 @@ FUNCTION_DEF(set_var, 2, 2, "set_var(string varname, variant value): sets the va
 		args()[1]->evaluate(variables)));
 END_FUNCTION_DEF(set_var)
 
+class add_debug_chart_command : public game_logic::command_callable {
+	std::string id_;
+	decimal value_;
+public:
+	add_debug_chart_command(const std::string& id, decimal value)
+	  : id_(id), value_(value)
+	{}
+
+	virtual void execute(game_logic::formula_callable& ob) const {
+	debug_console::add_graph_sample(id_, value_);
+	}
+};
+
+FUNCTION_DEF(debug_chart, 2, 2, "debug_chart(string id, decimal value): plots a sample in a graph")
+	return variant(new add_debug_chart_command(args()[0]->evaluate(variables).as_string(), args()[1]->evaluate(variables).as_decimal()));
+END_FUNCTION_DEF(debug_chart)
+
 class add_debug_rect_command : public game_logic::command_callable {
 	rect r_;
 public:
@@ -1078,6 +1122,7 @@ private:
 				bool done = false;
 				while(!done) {
 					if(!paused_) {
+						debug_console::process_graph();
 						lvl.process();
 						lvl.process_draw();
 					}
@@ -1902,23 +1947,6 @@ bool consecutive_periods(char a, char b) {
 	return a == '.' && b == '.';
 }
 }
-
-FUNCTION_DEF(eval, 1, 2, "eval(string formula, [obj context]): evaluate the given formula in the given context")
-	std::map<std::string, game_logic::formula_ptr> cache;
-	const variant fml = args()[0]->evaluate(variables);
-	game_logic::formula_ptr& f = cache[fml.as_string()];
-	if(f.get() == NULL) {
-		f = game_logic::formula::create_optional_formula(fml);
-	}
-
-	ASSERT_LOG(f.get() != NULL, "INVALID FORMULA PASSED TO EVAL: " << fml.as_string());
-
-	if(args().size() > 1) {
-		return f->execute(*args()[1]->evaluate(variables).as_callable());
-	} else {
-		return f->execute();
-	}
-END_FUNCTION_DEF(eval)
 
 FUNCTION_DEF(get_document, 1, 1, "get_document(string filename): return reference to the given JSON document")
 	const std::string docname = args()[0]->evaluate(variables).as_string();

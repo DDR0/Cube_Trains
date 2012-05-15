@@ -11,6 +11,7 @@
 #include "formula_callable.hpp"
 #include "game_registry.hpp"
 #include "json_parser.hpp"
+#include "module.hpp"
 #include "preferences.hpp"
 #include "sound.hpp"
 #include "variant_utils.hpp"
@@ -21,6 +22,8 @@
 #define AUTOSAVE_FILENAME				"autosave.cfg"
 
 #ifdef _WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 
@@ -30,7 +33,7 @@ public:
 	std::string GetPreferencePath()   { if (State* i = Instance()) return i->GetPreferencePath(); }
 	std::string GetSaveFilePath()     { if (State* i = Instance()) return i->GetSaveFilePath(); }
 	std::string GetAutoSaveFilePath() { if (State* i = Instance()) return i->GetAutoSaveFilePath(); }
-	
+
 private:
 	struct State 
 	{
@@ -41,14 +44,9 @@ private:
 	public:
 		State::State()
 		{
-			TCHAR szPath[ MAX_PATH ];
-			if( SUCCEEDED( SHGetFolderPath( NULL, CSIDL_APPDATA, NULL, 0, szPath ) ) ) 
-			{
-				::PathAppend( szPath, TEXT( "\\Frogatto\\" ) );
-			}
-			this->preferences_path = std::string( szPath );
-			this->save_file_path = this->preferences_path + TEXT( SAVE_FILENAME );
-			this->auto_save_file_path = this->preferences_path + TEXT( AUTOSAVE_FILENAME );
+			this->preferences_path = GetAppDataPath() + "/" + module::get_module_name() + "/";
+			this->save_file_path = this->preferences_path + SAVE_FILENAME;
+			this->auto_save_file_path = this->preferences_path + AUTOSAVE_FILENAME;
 		}
 		std::string GetPreferencePath()
 		{
@@ -72,6 +70,15 @@ private:
 	static bool MDestroyed;
 	static State* MInstance;
 };
+
+std::string GetAppDataPath() {
+	char szPath[ MAX_PATH ];
+	if(SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, szPath))) 
+	{
+		return std::string(szPath);
+	}
+	return std::string();
+}
 
 bool WindowsPrefs::MDestroyed = false;
 WindowsPrefs::State* WindowsPrefs::MInstance = 0;
@@ -120,6 +127,7 @@ namespace preferences {
 		int frame_time_millis_ = 20;
 
 		std::string level_path_ = "data/level/";
+		bool level_path_set_ = false;
 
 		bool relay_through_server_ = false;
 		
@@ -219,7 +227,12 @@ namespace preferences {
 		bool use_fbo_ = true;
 		bool use_bequ_ = true;
 		bool use_16bpp_textures_ = false;
+
 #else
+
+#if defined(_WINDOWS)
+#define PREFERENCES_PATH ""
+#endif // _WINDOWS
 
 #ifndef NO_UPLOAD_STATS
 		bool send_stats_ = true;
@@ -310,6 +323,19 @@ namespace preferences {
 		return !sys::get_dir(user_data_path()).empty();
 	}
 
+	void set_preferences_path_from_module( const std::string& name)
+	{
+#ifdef _WINDOWS
+		preferences::set_preferences_path(GetAppDataPath() + "/" + name + "/"); 
+#elif defined(__ANDROID__)
+		preferences::set_preferences_path("." + name + "/");
+#else
+		preferences::set_preferences_path("~/." + name + "/");
+#endif
+		save_file_path_ = preferences_path_ + SAVE_FILENAME;
+		auto_save_file_path_ = preferences_path_ + AUTOSAVE_FILENAME;	
+	}
+
 	void set_preferences_path(const std::string& path)
 	{
 		preferences_path_ = path;
@@ -323,6 +349,10 @@ namespace preferences {
 
 	const std::string& level_path() {
 		return level_path_;
+	}
+
+	bool is_level_path_set() {
+		return level_path_set_;
 	}
 	
 	const char *save_file_path() {
@@ -548,14 +578,19 @@ namespace preferences {
 
 	void load_preferences()
 	{
+		std::string path;
+		if(preferences_path_.empty()) {
 #if defined( _WINDOWS )
 		preferences_path_ = winPrefs.GetPreferencePath();
 		save_file_path_ = winPrefs.GetSaveFilePath();
 		auto_save_file_path_ = winPrefs.GetAutoSaveFilePath();
-		std::string path = preferences_path_;
+		path = preferences_path_;
 #else
-		std::string path = PREFERENCES_PATH;
+		path = PREFERENCES_PATH;
 #endif // defined( _WINDOWS )
+		} else {
+			path = preferences_path_;
+		}
 		expand_path(path);
 		if(!sys::file_exists(path + "preferences.cfg")) {
 			return;
@@ -656,6 +691,7 @@ namespace preferences {
 
 		if(arg_name == "--level-path") {
 			level_path_ = arg_value + "/";
+			level_path_set_ = true;
 		} else if(s == "--show-hitboxes") {
 			show_debug_hitboxes_ = true;
 		} else if(s == "--show-controls") {

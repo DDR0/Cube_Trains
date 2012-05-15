@@ -45,10 +45,12 @@ namespace {
 	bool _verbatim_string_expressions = false;
 }
 
-void output_formula_error_info() {
+std::string output_formula_error_info() {
 	if(last_executed_formula) {
-		last_executed_formula->output_debug_info();
+		return last_executed_formula->output_debug_info();
 	}
+
+	return "";
 }
 
 namespace game_logic
@@ -286,6 +288,10 @@ public:
 	
 private:
 	variant execute(const formula_callable& variables) const {
+		//since maps can be modified we want any map construction to return
+		//a brand new map.
+		formula::fail_if_static_context();
+
 		std::map<variant,variant> res;
 		for(std::vector<expression_ptr>::const_iterator i = items_.begin(); ( i != items_.end() ) && ( i+1 != items_.end() ) ; i+=2) {
 			variant key = (*i)->evaluate(variables);
@@ -345,7 +351,7 @@ public:
 	
 	variant get_value(const std::string& key) const {
 		if(key == "size") {
-			return variant(list_.num_elements());
+			return variant(unsigned(list_.num_elements()));
 		} else if(key == "empty") {
 			return variant(list_.num_elements() == 0);
 		} else if(key == "first") {
@@ -552,7 +558,7 @@ private:
 	}
 	
 	variant execute_member(const formula_callable& variables, std::string& id) const {
-		const variant left = left_->evaluate(variables);
+		variant left = left_->evaluate(variables);
 		
 		const identifier_expression* id_expr = dynamic_cast<identifier_expression*>(right_.get());
 		if(!id_expr) {
@@ -583,9 +589,17 @@ private:
 			return left.as_callable()->query_value(key.as_string());
 		} else {
 			std::cerr << "STACK TRACE FOR ERROR:\n" << get_call_stack() << "\n";
-			output_formula_error_info();
+			std::cerr << output_formula_error_info();
 			ASSERT_LOG(false, "illegal usage of operator []: called on " << left.to_debug_string() << " value: " << left_->str() << "'\n" << debug_pinpoint_location());
 		}
+	}
+	
+	variant execute_member(const formula_callable& variables, std::string& id) const {
+		const variant left = left_->evaluate(variables);
+		const variant key = key_->evaluate(variables);
+
+		id = key.as_string();
+		return left;
 	}
 	
 	expression_ptr left_, key_;
@@ -931,6 +945,8 @@ public:
 	explicit string_expression(std::string str, bool translate = false) : formula_expression("_string")
 	{
 		if (!_verbatim_string_expressions) {
+			const std::string original = str;
+
 			size_t pos = 0;
 			//replace \\n sequences with newlines
 			while((pos = str.find("\\n", pos)) != std::string::npos) {
@@ -944,14 +960,15 @@ public:
 				str = i18n::tr(str);
 			}
 
+			static const std::string BeginSub = "${";
 			std::string::iterator i;
-			while((i = std::find(str.begin(), str.end(), '{')) != str.end()) {
+			while((i = std::search(str.begin(), str.end(), BeginSub.begin(), BeginSub.end())) != str.end()) {
 				std::string::iterator j = std::find(i, str.end(), '}');
 				if(j == str.end()) {
 					break;
 				}
 			
-				const std::string formula_str(i+1, j);
+				const std::string formula_str(i+BeginSub.size(), j);
 				const int pos = i - str.begin();
 				str.erase(i, j+1);
 			
@@ -964,7 +981,7 @@ public:
 			std::reverse(subs_.begin(), subs_.end());
 
 			if(translate) {
-				str_ = variant::create_translated_string(str);
+				str_ = variant::create_translated_string(original, str);
 				return;
 			}
 		} else if (translate) {
@@ -1371,7 +1388,10 @@ expression_ptr parse_function_def(const variant& formula_str, const token*& i1, 
 
 	//create a definition of the callable representing
 	//function arguments.
-	formula_callable_definition_ptr args_definition = create_formula_callable_definition(&args[0], &args[0] + args.size(), formula_name.empty() ? callable_def : NULL /*only get the surrounding scope if we have a lambda function.*/);
+	formula_callable_definition_ptr args_definition;
+	if(args.size()) {
+		args_definition = create_formula_callable_definition(&args[0], &args[0] + args.size(), formula_name.empty() ? callable_def : NULL /*only get the surrounding scope if we have a lambda function.*/);
+	}
 	if(formula_name.empty() == false) {
 		for(int n = 0; n != types.size(); ++n) {
 			if(types[n].empty()) {
@@ -1725,13 +1745,6 @@ void formula::fail_if_static_context()
 		throw non_static_expression_exception();
 	}
 }
-	
-formula_ptr formula::create_string_formula(const std::string& str)
-{
-	formula_ptr res(new formula());
-	res->expr_.reset(new string_expression(str));
-	return res;
-}
 
 formula_ptr formula::create_optional_formula(const variant& val, function_symbol_table* symbols, const formula_callable_definition* callable_definition)
 {
@@ -1739,19 +1752,7 @@ formula_ptr formula::create_optional_formula(const variant& val, function_symbol
 		return formula_ptr();
 	}
 	
-	try {
-		return formula_ptr(new formula(val, symbols, callable_definition));
-	} catch(...) {
-//TODO: add detection of where the variant came from.
-//		if(val.filename()) {
-//			std::cerr << *val.filename() << " " << val.line() << ": ";
-//		}
-		
-		//for now die a horrible death on such errors
-		ASSERT_LOG(false, "ERROR parsing optional formula '" << val.as_string() << "'");
-		
-		return formula_ptr();
-	}
+	return formula_ptr(new formula(val, symbols, callable_definition));
 }
 
 formula::formula(const variant& val, function_symbol_table* symbols, const formula_callable_definition* callable_definition) : str_(val)
@@ -1971,12 +1972,14 @@ formula::~formula() {
 	}
 }
 
-void formula::output_debug_info() const
+std::string formula::output_debug_info() const
 {
-	std::cerr << "FORMULA: " << (str_.get_debug_info() ? str_.get_debug_info()->message() : "(UNKNOWN LOCATION): ");
+	std::ostringstream s;
+	s << "FORMULA: " << (str_.get_debug_info() ? str_.get_debug_info()->message() : "(UNKNOWN LOCATION): ");
 	//TODO: add debug info from str_ variant here.
 	
-	std::cerr << str_.as_string() << "\n";
+	s << str_.as_string() << "\n";
+	return s.str();
 }
 
 int formula::guard_matches(const formula_callable& variables) const
