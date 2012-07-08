@@ -14,6 +14,7 @@ CPPFLAGS += $(shell pkg-config --cflags sdl) \
 	    -I/usr/include/boost \
 	    -I/sw/include/SDL \
 	    -Isrc/
+
 LIBS += $(shell pkg-config --libs x11) \
 	-lSDLmain \
 	$(shell pkg-config --libs sdl) \
@@ -33,20 +34,20 @@ include Makefile.common
 
 %.o : src/%.cpp
 	$(CXX) \
-		$(CXXFLAGS) -fno-inline-functions -fthreadsafe-statics $(CPPFLAGS) -DIMPLEMENT_SAVE_PNG \
+		$(CXXFLAGS) -fno-inline-functions -fthreadsafe-statics -fno-strict-aliasing $(CPPFLAGS) -DIMPLEMENT_SAVE_PNG \
 		-c $<
 
 game: $(objects)
 	$(CXX) \
 		$(LDFLAGS) \
-		$(CXXFLAGS) -fno-inline-functions $(CPPFLAGS) \
+		$(CXXFLAGS) -fno-inline-functions -fthreadsafe-statics -fno-strict-aliasing $(CPPFLAGS) \
 		$(objects) -o game \
-		$(LIBS) -lboost_regex-mt -lboost_system-mt -lpthread -fthreadsafe-statics
+		$(LIBS) -lboost_regex-mt -lboost_system-mt -lpthread
 
 server: $(server_objects)
 	$(CXX) \
 		$(LDFLAGS) \
-		$(CXXFLAGS) -fno-inline-functions -fthreadsafe-statics $(CPPFLAGS) \
+		$(CXXFLAGS) -fno-inline-functions -fthreadsafe-statics -fno-strict-aliasing $(CPPFLAGS) \
 		$(server_objects) -o server \
 		$(LIBS) -lboost_regex-mt -lboost_system-mt -lboost_thread-mt -lboost_iostreams-mt
 
